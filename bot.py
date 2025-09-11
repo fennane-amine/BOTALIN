@@ -1,4 +1,4 @@
-# bot.py (final - aggressive baseline, cookie reuse, re-auth)
+# bot.py - aggressive final scroll version
 import os
 import time
 import json
@@ -240,7 +240,7 @@ def init_driver():
         raise
 
 
-# ---------- Aggressive baseline (reads displayed counts + forces scrolls) ----------
+# ---------- Final aggressive baseline (force scroll to page bottom) ----------
 def _get_displayed_count_for_section(driver, sect_name, timeout=12, poll=0.5):
     end = time.time() + timeout
     while time.time() < end:
@@ -265,7 +265,66 @@ def _get_displayed_count_for_section(driver, sect_name, timeout=12, poll=0.5):
     return None
 
 
-def gather_existing_offers(driver, max_scroll_attempts=20, scroll_pause=1.2):
+def _progressive_scroll_container_to_bottom(driver, container, max_attempts=30, pause=0.8):
+    """
+    Aggressively scroll the container to its bottom by:
+    - setting scrollTop to scrollHeight,
+    - doing small incremental scrolls (simulate user),
+    - scrolling the window as fallback.
+    Stop when card count stabilizes for several iterations or attempts exhausted.
+    Returns after attempts.
+    """
+    prev_counts = []
+    attempt = 0
+    while attempt < max_attempts:
+        try:
+            # try to set to bottom
+            driver.execute_script("arguments[0].scrollTop = arguments[0].scrollHeight;", container)
+        except Exception:
+            try:
+                driver.execute_script("window.scrollTo(0, document.body.scrollHeight);")
+            except Exception:
+                pass
+
+        # extra progressive scroll: small steps to trigger lazy loads
+        try:
+            # run a tiny JS loop that scrolls down a few steps (helps some virtualized lists)
+            js = """
+            const c = arguments[0];
+            const steps = 6;
+            const delay = 40;
+            for (let i=0;i<steps;i++){
+              c.scrollTop = c.scrollTop + Math.round(c.clientHeight/steps);
+            }
+            return true;
+            """
+            driver.execute_script(js, container)
+        except Exception:
+            pass
+
+        time.sleep(pause)
+        cards = get_offer_cards_in_current_section(driver)
+        cur_count = len(cards)
+        prev_counts.append(cur_count)
+        if len(prev_counts) > 5:
+            prev_counts.pop(0)
+        # if stable for 4 iterations => done
+        if len(prev_counts) >= 4 and all(x == prev_counts[0] for x in prev_counts):
+            logging.debug(f"Container scroll stable after {attempt+1} attempts with {cur_count} cards.")
+            break
+        attempt += 1
+    return
+
+
+def gather_existing_offers(driver, max_scroll_attempts=40, scroll_pause=0.8):
+    """
+    Very aggressive baseline:
+    - read displayed counts (with retries)
+    - click each section
+    - wait for the .offer-list-container, then force progressive scrolling *inside* the container and window
+    - stop when found count stabilizes or when displayed_count reached
+    """
+    # ensure top of page for predictable rendering
     try:
         driver.execute_script("window.scrollTo(0,0);")
     except Exception:
@@ -290,6 +349,7 @@ def gather_existing_offers(driver, max_scroll_attempts=20, scroll_pause=1.2):
             continue
 
         click_element(driver, btn)
+        # allow SPA to start updating
         time.sleep(1.0)
 
         try:
@@ -300,35 +360,46 @@ def gather_existing_offers(driver, max_scroll_attempts=20, scroll_pause=1.2):
             logging.info(f"No offer-list-container present for '{sect}' during baseline.")
             continue
 
+        # aggressive strategy: multiple scroll methods + container progressive scrolling
+        # 1) do several full window scrolls
+        for i in range(3):
+            try:
+                driver.execute_script("window.scrollTo(0, document.body.scrollHeight);")
+            except Exception:
+                pass
+            time.sleep(0.4)
+
+        # 2) progressive scroll inside container (major effort)
+        _progressive_scroll_container_to_bottom(driver, container, max_attempts=max_scroll_attempts, pause=scroll_pause)
+
+        # 3) small extra attempts of window scroll + wait
+        for i in range(4):
+            try:
+                driver.execute_script("window.scrollTo(0, document.body.scrollHeight);")
+            except Exception:
+                pass
+            time.sleep(scroll_pause)
+
+        # 4) final stabilization: sample counts until stable or attempts exhausted
         prev_counts = []
-        attempt = 0
-        while attempt < max_scroll_attempts:
+        attempts = 0
+        while attempts < 6:
             cards = get_offer_cards_in_current_section(driver)
             cur_count = len(cards)
-            logging.debug(f"[baseline] '{sect}' attempt {attempt+1}: found {cur_count} cards in DOM")
             prev_counts.append(cur_count)
-            if len(prev_counts) > 3:
+            if len(prev_counts) > 4:
                 prev_counts.pop(0)
-            if len(prev_counts) == 3 and prev_counts[0] == prev_counts[1] == prev_counts[2]:
-                logging.info(f"[baseline] '{sect}' stable after {attempt+1} attempts with {cur_count} cards.")
+            if len(prev_counts) >= 3 and prev_counts[-1] == prev_counts[-2] == prev_counts[-3]:
+                logging.debug(f"Final stabilization for '{sect}' with {cur_count} cards.")
                 break
-            dcount = displayed_counts.get(sect)
-            if dcount is not None and cur_count >= dcount:
-                logging.info(f"[baseline] '{sect}' reached displayed count {dcount} (found {cur_count}).")
-                break
-            try:
-                driver.execute_script("arguments[0].scrollTop = arguments[0].scrollHeight;", container)
-            except Exception:
-                try:
-                    driver.execute_script("window.scrollTo(0, document.body.scrollHeight);")
-                except Exception:
-                    pass
-            time.sleep(scroll_pause)
-            attempt += 1
+            time.sleep(0.6)
+            attempts += 1
 
+        # final fetch & log
         cards = get_offer_cards_in_current_section(driver)
         final_count = len(cards)
         logging.info(f"Baseline: gathered {final_count} cards in section '{sect}' (displayed_count={displayed_counts.get(sect)})")
+
         for card in cards:
             info = extract_offer_info(card)
             if info["uid"]:
@@ -411,6 +482,7 @@ def main():
             logging.error("Could not authenticate; stopping run.")
             return
 
+        # aggressive baseline gather
         existing = gather_existing_offers(driver)
         if existing:
             new_count = 0
