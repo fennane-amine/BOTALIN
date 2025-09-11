@@ -40,7 +40,7 @@ jobs:
           # optional: if you want to use PAT_FOR_PUSH instead of GITHUB_TOKEN, set it in repo secrets
           # PAT_FOR_PUSH: ${{ secrets.PAT_FOR_PUSH }}
         run: |
-          python quick_test.py
+          python bot.py
 
       - name: Commit offers_seen.json & session_cookies.json if changed
         env:
