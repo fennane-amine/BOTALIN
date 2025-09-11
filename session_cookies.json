@@ -1,0 +1,11 @@
+[
+  {
+    "domain": "al-in.fr",
+    "httpOnly": true,
+    "name": "JSESSIONID",
+    "path": "/",
+    "sameSite": "Lax",
+    "secure": true,
+    "value": "934B5523827D2421F7BA5AE844DE690D"
+  }
+]
