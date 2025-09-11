@@ -11,16 +11,10 @@ from selenium import webdriver
 from selenium.webdriver.common.by import By
 from selenium.webdriver.chrome.options import Options
 from selenium.webdriver.chrome.service import Service
-from selenium.common.exceptions import (
-    NoSuchElementException,
-    TimeoutException,
-    ElementClickInterceptedException,
-    WebDriverException,
-)
+from selenium.common.exceptions import TimeoutException
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
 
-# webdriver-manager imported for fallback
 from webdriver_manager.chrome import ChromeDriverManager
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
@@ -29,11 +23,11 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(
 BASE_URL = "https://al-in.fr/#/connexion-demandeur"
 EMAIL = os.environ.get("EMAIL")
 PASSWORD = os.environ.get("PASSWORD")
-# default run time per execution (seconds). Change via env MAX_RUN_SECONDS
 MAX_RUN_SECONDS = int(os.environ.get("MAX_RUN_SECONDS", 300))  # default 5 minutes
-POLL_INTERVAL = int(os.environ.get("POLL_INTERVAL", 15))  # seconds between checks
-WAIT_TIMEOUT = 10  # explicit waits set to 10s (as requested)
+POLL_INTERVAL = int(os.environ.get("POLL_INTERVAL", 15))
+WAIT_TIMEOUT = 10  # explicit waits: 10s
 SEEN_FILE = "offers_seen.json"
+COOKIES_FILE = "session_cookies.json"
 HEADLESS = os.environ.get("HEADLESS", "true").lower() in ("1", "true", "yes")
 
 if not EMAIL or not PASSWORD:
@@ -54,14 +48,67 @@ def save_seen(seen_set):
     try:
         with open(SEEN_FILE, "w", encoding="utf-8") as f:
             json.dump(list(seen_set), f, ensure_ascii=False, indent=2)
+        logging.info(f"Saved {len(seen_set)} seen offers to {SEEN_FILE}")
     except Exception as e:
         logging.warning(f"Failed to save seen file: {e}")
 
 
+def save_cookies(driver):
+    try:
+        cookies = driver.get_cookies()
+        with open(COOKIES_FILE, "w", encoding="utf-8") as f:
+            json.dump(cookies, f, ensure_ascii=False, indent=2)
+        logging.info(f"Saved {len(cookies)} cookies to {COOKIES_FILE}")
+    except Exception as e:
+        logging.warning(f"Failed to save cookies: {e}")
+
+
+def load_cookies_to_driver(driver):
+    if not os.path.exists(COOKIES_FILE):
+        logging.info("No cookies file found.")
+        return False
+    try:
+        with open(COOKIES_FILE, "r", encoding="utf-8") as f:
+            cookies = json.load(f)
+    except Exception as e:
+        logging.warning(f"Failed to read cookies file: {e}")
+        return False
+
+    if not cookies:
+        logging.info("Cookies file empty.")
+        return False
+
+    try:
+        driver.get("https://al-in.fr")
+    except Exception:
+        pass
+
+    added = 0
+    for c in cookies:
+        cookie = dict(c)
+        cookie.pop("sameSite", None)
+        cookie.pop("hostOnly", None)
+        # expiry must be int
+        if "expiry" in cookie:
+            try:
+                cookie["expiry"] = int(cookie["expiry"])
+            except Exception:
+                cookie.pop("expiry", None)
+        cookie.pop("domain", None)
+        try:
+            driver.add_cookie(cookie)
+            added += 1
+        except Exception as e:
+            logging.debug(f"Failed to add cookie {cookie.get('name')}: {e}")
+    logging.info(f"Attempted to load cookies into browser: added {added} cookies")
+    try:
+        driver.refresh()
+    except Exception:
+        pass
+    return added > 0
+
+
 def parse_price(price_text):
-    """
-    Extract integer euros from strings like '448 € (288 € Hors charge)' or ' 946 € '
-    """
     if not price_text:
         return None
     m = re.search(r"(\d{1,3}(?:[ \u00A0]\d{3})*|\d+)\s*€", price_text.replace("\u00A0", " "))
@@ -95,7 +142,6 @@ def get_offer_cards_in_current_section(driver):
     normalized = []
     for c in cards:
         try:
-            # if this element is the container directly
             classes = (c.get_attribute("class") or "")
             if "offer-card-container" in classes:
                 normalized.append(c)
@@ -138,10 +184,6 @@ def click_element(driver, el):
     except Exception:
         pass
     try:
-        WebDriverWait(driver, WAIT_TIMEOUT).until(EC.element_to_be_clickable((By.XPATH, ".")))
-    except Exception:
-        pass
-    try:
         el.click()
         return True
     except Exception:
@@ -153,38 +195,30 @@ def click_element(driver, el):
             return False
 
 
-# ---------- Driver init (Selenium Manager first, fallback to webdriver-manager) ----------
+# ---------- Driver init ----------
 def init_driver():
     options = Options()
     if HEADLESS:
-        # headless new mode
         options.add_argument("--headless=new")
     options.add_argument("--no-sandbox")
     options.add_argument("--disable-dev-shm-usage")
     options.add_argument("--window-size=1920,1080")
-    # optional: reduce detection by setting a standard user-agent if needed
-    # options.add_argument("user-agent=Mozilla/5.0 (X11; Linux x86_64) ...")
 
-    # Try Selenium Manager (automatic) first
     try:
         logging.info("Trying Selenium Manager (webdriver.Chrome(options=...))")
         driver = webdriver.Chrome(options=options)
         logging.info("Selenium Manager initialized Chrome successfully.")
         return driver
     except Exception as e:
-        logging.warning(f"Selenium Manager failed: {e}. Falling back to webdriver-manager approach.")
+        logging.warning(f"Selenium Manager failed: {e}. Falling back to webdriver-manager.")
 
-    # Fallback to webdriver-manager robust approach
     try:
         logging.info("Using webdriver-manager to download/find chromedriver")
-        driver_path = ChromeDriverManager().install()  # may return folder or path
-
-        # If returned path is a directory, search for chromedriver binary inside
+        driver_path = ChromeDriverManager().install()
         if os.path.isdir(driver_path):
             found = None
             for root, dirs, files in os.walk(driver_path):
                 for f in files:
-                    # accept files that start with chromedriver (handles platform variations)
                     if f.lower().startswith("chromedriver"):
                         found = os.path.join(root, f)
                         break
@@ -193,14 +227,11 @@ def init_driver():
             if not found:
                 raise RuntimeError(f"No chromedriver binary found in {driver_path}")
             driver_path = found
-
-        # ensure executable
         try:
             st = os.stat(driver_path)
             os.chmod(driver_path, st.st_mode | stat.S_IEXEC)
         except Exception as e:
             logging.warning(f"chmod on chromedriver failed: {e}")
-
         service = Service(driver_path)
         driver = webdriver.Chrome(service=service, options=options)
         logging.info("Chrome initialized with webdriver-manager chromedriver.")
@@ -210,43 +241,147 @@ def init_driver():
         raise
 
 
-# ---------- Main logic ----------
-def main():
-    logging.info("Starting bot")
-    seen = load_seen()
-    logging.info(f"Loaded {len(seen)} seen offers")
-
-    driver = None
+# ---------- New: gather existing offers ----------
+def gather_existing_offers(driver):
+    """
+    Click each section and gather all visible offer UIDs.
+    Returns set(uid).
+    """
+    found_uids = set()
+    # attempt to read textual counts from offer-sections for logging
     try:
-        driver = init_driver()
-    except Exception as e:
-        logging.error(f"Driver initialization failed: {e}")
-        return
+        sects = driver.find_elements(By.CSS_SELECTOR, ".offer-sections .section")
+        counts = {}
+        for s in sects:
+            text = s.text.strip()
+            # expect format "Communes limitrophes \n 15" or similar
+            parts = text.split()
+            # heuristic: last token numeric
+            if parts and parts[-1].isdigit():
+                name = " ".join(parts[:-1]).strip()
+                counts[name] = int(parts[-1])
+        if counts:
+            logging.info(f"Section counts found on page: {counts}")
+    except Exception:
+        logging.debug("Could not read section counts.")
 
-    wait = WebDriverWait(driver, WAIT_TIMEOUT)
+    section_names = [
+        "Communes demandées",
+        "Communes limitrophes",
+        "Autres communes du département"
+    ]
+    for sect in section_names:
+        btn = find_section_button(driver, sect)
+        if not btn:
+            logging.debug(f"Section button '{sect}' not found when gathering existing offers.")
+            continue
+        click_element(driver, btn)
+        # give a little time for SPA to populate
+        time.sleep(1)
+        # try a couple times to gather lists (in case lazy loading)
+        cards = get_offer_cards_in_current_section(driver)
+        # if none, wait a bit and retry once
+        if not cards:
+            time.sleep(1)
+            cards = get_offer_cards_in_current_section(driver)
+        logging.info(f"Gathered {len(cards)} cards in section '{sect}' during baseline scan.")
+        for card in cards:
+            info = extract_offer_info(card)
+            if info["uid"]:
+                found_uids.add(info["uid"])
+    return found_uids
 
+
+# ---------- Login utilities ----------
+def is_logged_in(driver):
+    try:
+        driver.find_element(By.CSS_SELECTOR, ".offer-sections")
+        return True
+    except Exception:
+        return False
+
+
+def perform_login(driver, wait):
     try:
         driver.get(BASE_URL)
-        # wait login form
+    except Exception:
+        pass
+
+    try:
         wait.until(EC.presence_of_element_located((By.CSS_SELECTOR, "form.global-form")))
-        # fill login
         mail_input = wait.until(EC.presence_of_element_located((By.CSS_SELECTOR, 'input[formcontrolname="mail"]')))
         pwd_input = wait.until(EC.presence_of_element_located((By.CSS_SELECTOR, 'input[formcontrolname="password"]')))
         mail_input.clear()
         mail_input.send_keys(EMAIL)
         pwd_input.clear()
         pwd_input.send_keys(PASSWORD)
-        # click connect
         try:
             btn = wait.until(EC.element_to_be_clickable((By.XPATH, "//button[contains(.,'JE ME CONNECTE') or contains(.,'Je me connecte')]")))
             btn.click()
         except TimeoutException:
-            logging.error("Login button not found; aborting.")
+            logging.error("Login button not found during perform_login.")
+            return False
+        wait.until(EC.presence_of_element_located((By.CSS_SELECTOR, ".offer-sections")))
+        logging.info("Login successful.")
+        save_cookies(driver)
+        return True
+    except Exception as e:
+        logging.error(f"Login process failed: {e}")
+        return False
+
+
+def ensure_logged_in(driver, wait):
+    if is_logged_in(driver):
+        return True
+    logging.info("Not logged in. Trying to load cookies if available.")
+    try:
+        loaded = load_cookies_to_driver(driver)
+        if loaded and is_logged_in(driver):
+            logging.info("Logged in after loading cookies.")
+            return True
+    except Exception as e:
+        logging.debug(f"Loading cookies raised: {e}")
+    logging.info("Performing full login with credentials.")
+    ok = perform_login(driver, wait)
+    if not ok:
+        logging.error("Full login failed.")
+    return ok
+
+
+# ---------- Main ----------
+def main():
+    logging.info("Starting bot")
+    seen = load_seen()
+    logging.info(f"Loaded {len(seen)} seen offers (from {SEEN_FILE} if present)")
+
+    try:
+        driver = init_driver()
+    except Exception as e:
+        logging.error(f"Driver init failed: {e}")
+        return
+
+    wait = WebDriverWait(driver, WAIT_TIMEOUT)
+    try:
+        # authenticate (use cookies if possible)
+        if not ensure_logged_in(driver, wait):
+            logging.error("Could not authenticate; stopping run.")
             return
 
-        # wait for offer sections to appear
-        wait.until(EC.presence_of_element_located((By.CSS_SELECTOR, ".offer-sections")))
+        # -------- baseline: gather currently visible offers and ignore them ----------
+        existing = gather_existing_offers(driver)
+        if existing:
+            new_count = 0
+            for uid in existing:
+                if uid not in seen:
+                    seen.add(uid)
+                    new_count += 1
+            if new_count:
+                save_seen(seen)
+            logging.info(f"Baseline: added {new_count} current offers to seen. Total seen now: {len(seen)}")
+        else:
+            logging.info("Baseline scan found no offers (page maybe empty).")
 
+        # ---------- main polling loop ----------
         start_time = datetime.utcnow()
         end_time = start_time + timedelta(seconds=MAX_RUN_SECONDS)
         logging.info(f"Bot will run until {end_time.isoformat()} UTC (or until it finds & applies). Poll every {POLL_INTERVAL}s")
@@ -258,6 +393,13 @@ def main():
         ]
 
         while datetime.utcnow() < end_time:
+            # ensure still logged in
+            if not is_logged_in(driver):
+                logging.warning("Session appears logged out during run. Re-authenticating...")
+                if not ensure_logged_in(driver, wait):
+                    logging.error("Re-authentication failed; aborting this run.")
+                    break
+
             applied = False
             for sect in section_names:
                 logging.info(f"Selecting section '{sect}'")
@@ -266,7 +408,7 @@ def main():
                     logging.warning(f"Section '{sect}' not found; skipping")
                     continue
                 click_element(driver, btn)
-                time.sleep(1)  # allow DOM refresh
+                time.sleep(1)
 
                 cards = get_offer_cards_in_current_section(driver)
                 logging.info(f"Found {len(cards)} cards in '{sect}'")
@@ -274,20 +416,26 @@ def main():
                     info = extract_offer_info(card)
                     uid = info["uid"]
                     logging.debug(f"Offer uid={uid} price={info['price']} typ={info['typ']} loc={info['loc']}")
-                    if uid in seen:
+                    # ignore if in seen baseline or previously applied
+                    if not uid or uid in seen:
                         continue
                     if info["price"] is None:
                         continue
                     is_t2 = "T2" in info["typ"].upper() or "| T2" in info["typ"].upper()
                     if is_t2 and info["price"] <= 600:
                         logging.info(f"Found matching NEW offer: {info}")
-                        # open offer by clicking image
                         try:
                             img_el = card.find_element(By.CSS_SELECTOR, ".offer-image img")
                             click_element(driver, img_el)
                         except Exception as e:
                             logging.warning(f"Could not open offer detail: {e}")
                             continue
+
+                        if not is_logged_in(driver):
+                            logging.warning("Session logged out just before applying. Re-authenticating...")
+                            if not ensure_logged_in(driver, wait):
+                                logging.error("Re-authentication failed; cannot apply.")
+                                continue
 
                         # apply
                         try:
@@ -334,12 +482,14 @@ def main():
                             logging.info(f"Application result text: {val}")
                             seen.add(uid)
                             save_seen(seen)
+                            save_cookies(driver)
                             applied = True
                             break
                         except TimeoutException:
-                            logging.warning("Result text not found; still saving seen and exiting.")
+                            logging.warning("Result text not found; still saving seen and continuing.")
                             seen.add(uid)
                             save_seen(seen)
+                            save_cookies(driver)
                             applied = True
                             break
 
@@ -350,7 +500,6 @@ def main():
                 logging.info("Applied to an offer; stopping this run.")
                 break
 
-            # no match found in all sections; sleep until next poll or until end_time
             remaining = (end_time - datetime.utcnow()).total_seconds()
             if remaining <= 0:
                 break
@@ -363,8 +512,7 @@ def main():
         logging.error(f"Unhandled error in main loop: {e}")
     finally:
         try:
-            if driver:
-                driver.quit()
+            driver.quit()
         except Exception:
             pass
 
