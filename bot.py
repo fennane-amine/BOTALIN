@@ -1,4 +1,4 @@
-# bot.py (final version with robust baseline + cookie reuse + re-auth)
+# bot.py (final - aggressive baseline, cookie reuse, re-auth)
 import os
 import time
 import json
@@ -88,7 +88,6 @@ def load_cookies_to_driver(driver):
         cookie = dict(c)
         cookie.pop("sameSite", None)
         cookie.pop("hostOnly", None)
-        # expiry must be int
         if "expiry" in cookie:
             try:
                 cookie["expiry"] = int(cookie["expiry"])
@@ -138,7 +137,6 @@ def get_offer_cards_in_current_section(driver):
         )
     except TimeoutException:
         return []
-    # collect app-offer-card or .offer-card-container
     cards = container.find_elements(By.CSS_SELECTOR, "app-offer-card, .offer-card-container")
     normalized = []
     for c in cards:
@@ -205,7 +203,6 @@ def init_driver():
     options.add_argument("--disable-dev-shm-usage")
     options.add_argument("--window-size=1920,1080")
 
-    # Try Selenium Manager (automatic)
     try:
         logging.info("Trying Selenium Manager (webdriver.Chrome(options=...))")
         driver = webdriver.Chrome(options=options)
@@ -214,7 +211,6 @@ def init_driver():
     except Exception as e:
         logging.warning(f"Selenium Manager failed: {e}. Falling back to webdriver-manager.")
 
-    # Fallback to webdriver-manager robust approach
     try:
         logging.info("Using webdriver-manager to download/find chromedriver")
         driver_path = ChromeDriverManager().install()
@@ -244,12 +240,8 @@ def init_driver():
         raise
 
 
-# ---------- Improved baseline helpers ----------
-def _get_displayed_count_for_section(driver, sect_name, timeout=8, poll=0.5):
-    """
-    Try to read the numeric count shown in the .offer-sections .section element that contains sect_name.
-    Returns int or None if no number found within timeout.
-    """
+# ---------- Aggressive baseline (reads displayed counts + forces scrolls) ----------
+def _get_displayed_count_for_section(driver, sect_name, timeout=12, poll=0.5):
     end = time.time() + timeout
     while time.time() < end:
         try:
@@ -257,17 +249,14 @@ def _get_displayed_count_for_section(driver, sect_name, timeout=8, poll=0.5):
             for s in sections:
                 try:
                     full_text = s.text.strip()
-                    # try to find a span numeric first
-                    try:
-                        span = s.find_element(By.TAG_NAME, "span")
-                        span_text = span.text.strip()
-                        if span_text.isdigit() and sect_name in full_text:
-                            return int(span_text)
-                    except Exception:
-                        # fallback to any digits in full_text
-                        m = re.search(r"(\d+)", full_text)
-                        if m and sect_name in full_text:
-                            return int(m.group(1))
+                    spans = s.find_elements(By.TAG_NAME, "span")
+                    if spans:
+                        txt = spans[-1].text.strip()
+                        if txt.isdigit() and sect_name in full_text:
+                            return int(txt)
+                    m = re.search(r"(\d+)", full_text)
+                    if m and sect_name in full_text:
+                        return int(m.group(1))
                 except Exception:
                     continue
         except Exception:
@@ -276,15 +265,12 @@ def _get_displayed_count_for_section(driver, sect_name, timeout=8, poll=0.5):
     return None
 
 
-def gather_existing_offers(driver, max_scroll_attempts=10, scroll_pause=1.0):
-    """
-    Improved baseline scan:
-    - reads displayed counts reliably (with retries),
-    - clicks each section, waits for .offer-list-container,
-    - forces scrolls to trigger lazy-load up to max_scroll_attempts,
-    - stops early if found_count >= displayed_count or if found_count is stable.
-    Returns set(uid).
-    """
+def gather_existing_offers(driver, max_scroll_attempts=20, scroll_pause=1.2):
+    try:
+        driver.execute_script("window.scrollTo(0,0);")
+    except Exception:
+        pass
+
     found_uids = set()
     section_names = [
         "Communes demandées",
@@ -292,11 +278,9 @@ def gather_existing_offers(driver, max_scroll_attempts=10, scroll_pause=1.0):
         "Autres communes du département"
     ]
 
-    # read displayed counts for logging (try to be robust with retries)
     displayed_counts = {}
     for sect in section_names:
-        cnt = _get_displayed_count_for_section(driver, sect, timeout=8, poll=0.5)
-        displayed_counts[sect] = cnt
+        displayed_counts[sect] = _get_displayed_count_for_section(driver, sect, timeout=12, poll=0.5)
     logging.info(f"Displayed section counts (after wait): {displayed_counts}")
 
     for sect in section_names:
@@ -306,9 +290,8 @@ def gather_existing_offers(driver, max_scroll_attempts=10, scroll_pause=1.0):
             continue
 
         click_element(driver, btn)
-        time.sleep(0.8)  # let SPA start loading
+        time.sleep(1.0)
 
-        # wait for container presence
         try:
             container = WebDriverWait(driver, WAIT_TIMEOUT).until(
                 EC.presence_of_element_located((By.CSS_SELECTOR, ".offer-list-container"))
@@ -317,32 +300,22 @@ def gather_existing_offers(driver, max_scroll_attempts=10, scroll_pause=1.0):
             logging.info(f"No offer-list-container present for '{sect}' during baseline.")
             continue
 
-        # attempt scrolls and monitor count stability
-        prev_count = -1
-        stable_iterations = 0
+        prev_counts = []
         attempt = 0
         while attempt < max_scroll_attempts:
             cards = get_offer_cards_in_current_section(driver)
             cur_count = len(cards)
             logging.debug(f"[baseline] '{sect}' attempt {attempt+1}: found {cur_count} cards in DOM")
-
-            # stability check
-            if cur_count == prev_count:
-                stable_iterations += 1
-            else:
-                stable_iterations = 0
-            prev_count = cur_count
-
+            prev_counts.append(cur_count)
+            if len(prev_counts) > 3:
+                prev_counts.pop(0)
+            if len(prev_counts) == 3 and prev_counts[0] == prev_counts[1] == prev_counts[2]:
+                logging.info(f"[baseline] '{sect}' stable after {attempt+1} attempts with {cur_count} cards.")
+                break
             dcount = displayed_counts.get(sect)
             if dcount is not None and cur_count >= dcount:
                 logging.info(f"[baseline] '{sect}' reached displayed count {dcount} (found {cur_count}).")
                 break
-
-            if stable_iterations >= 2:
-                logging.info(f"[baseline] '{sect}' stable after {attempt+1} attempts with {cur_count} cards.")
-                break
-
-            # scroll container bottom to trigger lazy loading
             try:
                 driver.execute_script("arguments[0].scrollTop = arguments[0].scrollHeight;", container)
             except Exception:
@@ -350,15 +323,12 @@ def gather_existing_offers(driver, max_scroll_attempts=10, scroll_pause=1.0):
                     driver.execute_script("window.scrollTo(0, document.body.scrollHeight);")
                 except Exception:
                     pass
-
             time.sleep(scroll_pause)
             attempt += 1
 
-        # final fetch & log
         cards = get_offer_cards_in_current_section(driver)
         final_count = len(cards)
         logging.info(f"Baseline: gathered {final_count} cards in section '{sect}' (displayed_count={displayed_counts.get(sect)})")
-
         for card in cards:
             info = extract_offer_info(card)
             if info["uid"]:
@@ -437,12 +407,10 @@ def main():
 
     wait = WebDriverWait(driver, WAIT_TIMEOUT)
     try:
-        # authenticate (use cookies if possible)
         if not ensure_logged_in(driver, wait):
             logging.error("Could not authenticate; stopping run.")
             return
 
-        # baseline: gather currently visible offers and ignore them
         existing = gather_existing_offers(driver)
         if existing:
             new_count = 0
@@ -456,7 +424,6 @@ def main():
         else:
             logging.info("Baseline scan found no offers (page maybe empty).")
 
-        # main polling loop
         start_time = datetime.utcnow()
         end_time = start_time + timedelta(seconds=MAX_RUN_SECONDS)
         logging.info(f"Bot will run until {end_time.isoformat()} UTC (or until it finds & applies). Poll every {POLL_INTERVAL}s")
@@ -468,7 +435,6 @@ def main():
         ]
 
         while datetime.utcnow() < end_time:
-            # ensure still logged in
             if not is_logged_in(driver):
                 logging.warning("Session appears logged out during run. Re-authenticating...")
                 if not ensure_logged_in(driver, wait):
@@ -491,7 +457,6 @@ def main():
                     info = extract_offer_info(card)
                     uid = info["uid"]
                     logging.debug(f"Offer uid={uid} price={info['price']} typ={info['typ']} loc={info['loc']}")
-                    # ignore if in seen baseline or previously applied
                     if not uid or uid in seen:
                         continue
                     if info["price"] is None:
@@ -499,7 +464,6 @@ def main():
                     is_t2 = "T2" in info["typ"].upper() or "| T2" in info["typ"].upper()
                     if is_t2 and info["price"] <= 600:
                         logging.info(f"Found matching NEW offer: {info}")
-                        # open offer by clicking image
                         try:
                             img_el = card.find_element(By.CSS_SELECTOR, ".offer-image img")
                             click_element(driver, img_el)
@@ -507,14 +471,12 @@ def main():
                             logging.warning(f"Could not open offer detail: {e}")
                             continue
 
-                        # ensure still logged in before applying
                         if not is_logged_in(driver):
                             logging.warning("Session logged out just before applying. Re-authenticating...")
                             if not ensure_logged_in(driver, wait):
                                 logging.error("Re-authentication failed; cannot apply.")
                                 continue
 
-                        # apply
                         try:
                             apply_btn = WebDriverWait(driver, WAIT_TIMEOUT).until(
                                 EC.element_to_be_clickable((By.XPATH, "//button[contains(.,'Je postule') or contains(.,'JE POSTULE') or contains(.,'Je postuler')]"))
@@ -530,7 +492,6 @@ def main():
                                 logging.error(f"Failed to click apply: {e}")
                                 continue
 
-                        # confirm
                         try:
                             confirm_btn = WebDriverWait(driver, WAIT_TIMEOUT).until(
                                 EC.element_to_be_clickable((By.XPATH, "//button[contains(.,'Confirmer')]"))
@@ -540,7 +501,6 @@ def main():
                         except TimeoutException:
                             logging.warning("Confirm button not found (maybe not required)")
 
-                        # ok
                         try:
                             ok_btn = WebDriverWait(driver, WAIT_TIMEOUT).until(
                                 EC.element_to_be_clickable((By.XPATH, "//button[normalize-space(.)='Ok' or contains(.,'Ok') or contains(.,'OK')]"))
@@ -550,7 +510,6 @@ def main():
                         except TimeoutException:
                             logging.warning("Ok button not found (maybe not required)")
 
-                        # read result text
                         try:
                             txt = WebDriverWait(driver, WAIT_TIMEOUT).until(
                                 EC.presence_of_element_located((By.CSS_SELECTOR, ".text_picto_vert"))
