@@ -1,36 +1,56 @@
 import json
 import logging
+import os
+import tempfile
 import time
+
 from selenium import webdriver
-from selenium.webdriver.common.by import By
-from selenium.webdriver.chrome.service import Service
 from selenium.webdriver.chrome.options import Options
+from selenium.webdriver.common.by import By
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
-from selenium.common.exceptions import TimeoutException
 
-# -------------------- CONFIG --------------------
-USERNAME = "TON_EMAIL"
-PASSWORD = "TON_MOT_DE_PASSE"
-LOGIN_URL = "https://example.com/login"
-OFFERS_URL = "https://example.com/offers"
+# ------------------ CONFIG ------------------
+LOGIN_URL = "https://example.com/login"  # Remplace par ton URL de login
+OFFERS_URL = "https://example.com/offers"  # Remplace par l'URL des offres
+EMAIL = "ton_email@example.com"
+PASSWORD = "ton_mot_de_passe"
+TEST_MODE = True  # True = n'applique qu'à la première offre
+
 COOKIES_FILE = "session_cookies.json"
 OFFERS_SEEN_FILE = "offers_seen.json"
-WAIT_TIMEOUT = 10
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
+# ------------------ LOGGING ------------------
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s - %(levelname)s - %(message)s"
+)
 
-# -------------------- UTILITAIRES --------------------
-def load_seen_offers():
-    try:
-        with open(OFFERS_SEEN_FILE, "r") as f:
-            return json.load(f)
-    except FileNotFoundError:
-        return []
+# ------------------ DRIVER ------------------
+def init_driver():
+    options = Options()
+    options.add_argument("--start-maximized")
+    options.add_argument("--disable-blink-features=AutomationControlled")
 
-def save_seen_offers(seen):
-    with open(OFFERS_SEEN_FILE, "w") as f:
-        json.dump(seen, f)
+    # Utiliser un dossier temporaire unique pour éviter conflit user-data-dir
+    temp_dir = tempfile.mkdtemp()
+    options.add_argument(f"--user-data-dir={temp_dir}")
+
+    driver = webdriver.Chrome(options=options)
+    return driver
+
+# ------------------ COOKIES ------------------
+def load_cookies(driver):
+    if os.path.exists(COOKIES_FILE):
+        logging.info(f"Attempting to load cookies from {COOKIES_FILE}")
+        with open(COOKIES_FILE, "r") as f:
+            cookies = json.load(f)
+        driver.get(LOGIN_URL)  # Nécessaire pour charger les cookies sur le domaine correct
+        for cookie in cookies:
+            driver.add_cookie(cookie)
+        logging.info(f"Added {len(cookies)} cookies")
+        return True
+    return False
 
 def save_cookies(driver):
     cookies = driver.get_cookies()
@@ -38,114 +58,100 @@ def save_cookies(driver):
         json.dump(cookies, f)
     logging.info(f"Saved {len(cookies)} cookies to {COOKIES_FILE}")
 
-def load_cookies(driver):
-    try:
-        with open(COOKIES_FILE, "r") as f:
-            cookies = json.load(f)
-        for cookie in cookies:
-            driver.add_cookie(cookie)
-        logging.info(f"Loaded {len(cookies)} cookies into browser")
-    except FileNotFoundError:
-        logging.info("No cookies file found, will login manually")
-
-# -------------------- SELENIUM SETUP --------------------
-def init_driver():
-    options = Options()
-    options.add_argument("--start-maximized")
-    options.add_argument("--disable-blink-features=AutomationControlled")
-    driver = webdriver.Chrome(options=options)
-    return driver
-
-# -------------------- LOGIN --------------------
-def login(driver):
+# ------------------ LOGIN ------------------
+def perform_login(driver):
+    logging.info("Performing full login with credentials")
     driver.get(LOGIN_URL)
-    load_cookies(driver)
-    driver.get(OFFERS_URL)
+    time.sleep(2)  # attendre que la page charge
 
-    # Vérifier si déjà logué
-    try:
-        WebDriverWait(driver, WAIT_TIMEOUT).until(
-            EC.presence_of_element_located((By.CSS_SELECTOR, ".offer-list-container"))
-        )
-        logging.info("Already logged in via cookies.")
-        return
-    except TimeoutException:
-        logging.info("Not logged in. Performing full login...")
-
-    # Remplir email / mot de passe
-    driver.get(LOGIN_URL)
-    WebDriverWait(driver, WAIT_TIMEOUT).until(EC.presence_of_element_located((By.NAME, "email"))).send_keys(USERNAME)
+    # Remplace ces sélecteurs par ceux de ton formulaire
+    driver.find_element(By.NAME, "email").send_keys(EMAIL)
     driver.find_element(By.NAME, "password").send_keys(PASSWORD)
-    driver.find_element(By.CSS_SELECTOR, "button[type=submit]").click()
+    driver.find_element(By.XPATH, "//button[@type='submit']").click()
 
-    # Attendre que la page des offres soit chargée
-    WebDriverWait(driver, WAIT_TIMEOUT).until(
-        EC.presence_of_element_located((By.CSS_SELECTOR, ".offer-list-container"))
+    # Attendre que le login réussisse
+    WebDriverWait(driver, 10).until(
+        EC.url_changes(LOGIN_URL)
     )
-    logging.info("Login successful.")
+    logging.info("Login successful")
     save_cookies(driver)
 
-# -------------------- RÉCUPÉRER LES OFFRES --------------------
-def get_offer_cards_in_current_section(driver):
-    try:
-        container = WebDriverWait(driver, WAIT_TIMEOUT).until(
-            EC.presence_of_element_located((By.CSS_SELECTOR, ".offer-list-container"))
-        )
+# ------------------ OFFERS ------------------
+def fetch_offers(driver):
+    logging.info("Fetching offers")
+    driver.get(OFFERS_URL)
+    time.sleep(2)  # attendre le chargement initial
+    WebDriverWait(driver, 10).until(
+        EC.presence_of_element_located((By.CSS_SELECTOR, "app-offer-card"))
+    )
 
-        # Scroll pour charger toutes les offres
-        driver.execute_script("arguments[0].scrollTop = arguments[0].scrollHeight;", container)
-        time.sleep(1)  # attendre que les cartes se chargent
+    offer_elements = driver.find_elements(By.CSS_SELECTOR, "app-offer-card")
+    logging.info(f"Found {len(offer_elements)} offers")
+    offers = []
 
-        cards = container.find_elements(By.CSS_SELECTOR, "app-offer-card")
-        logging.info(f"Detected {len(cards)} offer cards in current section")
-        return cards
+    for el in offer_elements:
+        try:
+            price = el.find_element(By.CSS_SELECTOR, ".price").text.strip()
+            typology = el.find_element(By.CSS_SELECTOR, ".typology").text.strip()
+            location = el.find_element(By.CSS_SELECTOR, ".location").text.strip()
+            offers.append({
+                "price": price,
+                "typology": typology,
+                "location": location
+            })
+        except:
+            continue
+    return offers
 
-    except TimeoutException:
-        logging.warning("No offers found in this section.")
-        return []
+def apply_to_offer(driver, offer):
+    logging.info(f"Applying to offer: {offer['location']} - {offer['typology']} - {offer['price']}")
+    # Ici, ajoute ton code pour cliquer sur le bouton postuler ou remplir le formulaire
+    # Exemple :
+    # el.find_element(By.CSS_SELECTOR, ".apply-button").click()
+    time.sleep(1)  # Simule un petit délai
 
-# -------------------- POSTULER À UNE OFFRE --------------------
-def apply_to_offer(card):
-    try:
-        # Cliquer sur l'offre
-        card.click()
-        time.sleep(1)  # attendre le chargement du formulaire
-
-        # Exemple : cliquer sur le bouton "Postuler"
-        apply_button = WebDriverWait(card.parent, WAIT_TIMEOUT).until(
-            EC.element_to_be_clickable((By.CSS_SELECTOR, "button.apply"))
-        )
-        apply_button.click()
-        logging.info("Applied to offer successfully.")
-    except Exception as e:
-        logging.error(f"Failed to apply to offer: {e}")
-
-# -------------------- BOT PRINCIPAL --------------------
+# ------------------ MAIN ------------------
 def run_bot():
     logging.info("Starting bot")
-    seen_offers = load_seen_offers()
+    offers_seen = []
+    if os.path.exists(OFFERS_SEEN_FILE):
+        with open(OFFERS_SEEN_FILE, "r") as f:
+            offers_seen = json.load(f)
+        logging.info(f"Loaded {len(offers_seen)} seen offers")
+
     driver = init_driver()
 
     try:
-        login(driver)
-        driver.get(OFFERS_URL)
-        cards = get_offer_cards_in_current_section(driver)
-
-        # Appliquer à la première offre non vue
-        for card in cards:
-            offer_id = card.get_attribute("outerHTML")[:50]  # ou utiliser un ID unique si dispo
-            if offer_id not in seen_offers:
-                apply_to_offer(card)
-                seen_offers.append(offer_id)
-                save_seen_offers(seen_offers)
-                break
+        if not load_cookies(driver):
+            perform_login(driver)
         else:
-            logging.info("No new offers to apply for.")
+            driver.get(OFFERS_URL)
+            logging.info("Loaded cookies, logged in")
+
+        offers = fetch_offers(driver)
+
+        if not offers:
+            logging.warning("No offers found")
+            return
+
+        for i, offer in enumerate(offers):
+            key = f"{offer['location']}|{offer['typology']}|{offer['price']}"
+            if key in offers_seen:
+                continue
+
+            apply_to_offer(driver, offer)
+            offers_seen.append(key)
+
+            if TEST_MODE:
+                logging.info("TEST MODE: only applying to first new offer")
+                break
 
     finally:
-        logging.info("Bot finished run.")
         driver.quit()
+        with open(OFFERS_SEEN_FILE, "w") as f:
+            json.dump(offers_seen, f)
+        logging.info("Bot finished run")
 
-# -------------------- LANCEMENT --------------------
+# ------------------ RUN ------------------
 if __name__ == "__main__":
     run_bot()
