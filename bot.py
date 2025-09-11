@@ -1,4 +1,4 @@
-# bot.py (version mise à jour : baseline scroll + lecture des counts affichés)
+# bot.py (final version with robust baseline + cookie reuse + re-auth)
 import os
 import time
 import json
@@ -88,6 +88,7 @@ def load_cookies_to_driver(driver):
         cookie = dict(c)
         cookie.pop("sameSite", None)
         cookie.pop("hostOnly", None)
+        # expiry must be int
         if "expiry" in cookie:
             try:
                 cookie["expiry"] = int(cookie["expiry"])
@@ -137,7 +138,7 @@ def get_offer_cards_in_current_section(driver):
         )
     except TimeoutException:
         return []
-    # collect app-offer-card or offer-card-container
+    # collect app-offer-card or .offer-card-container
     cards = container.find_elements(By.CSS_SELECTOR, "app-offer-card, .offer-card-container")
     normalized = []
     for c in cards:
@@ -204,6 +205,7 @@ def init_driver():
     options.add_argument("--disable-dev-shm-usage")
     options.add_argument("--window-size=1920,1080")
 
+    # Try Selenium Manager (automatic)
     try:
         logging.info("Trying Selenium Manager (webdriver.Chrome(options=...))")
         driver = webdriver.Chrome(options=options)
@@ -212,6 +214,7 @@ def init_driver():
     except Exception as e:
         logging.warning(f"Selenium Manager failed: {e}. Falling back to webdriver-manager.")
 
+    # Fallback to webdriver-manager robust approach
     try:
         logging.info("Using webdriver-manager to download/find chromedriver")
         driver_path = ChromeDriverManager().install()
@@ -241,12 +244,46 @@ def init_driver():
         raise
 
 
-# ---------- Baseline scan (improved) ----------
-def gather_existing_offers(driver, max_scroll_attempts=6, scroll_pause=0.8):
+# ---------- Improved baseline helpers ----------
+def _get_displayed_count_for_section(driver, sect_name, timeout=8, poll=0.5):
     """
-    Click each section, read the displayed count (span) and then force scrolls on the offer list container
-    to trigger lazy-loading. Repeat until found_cards is stable or matches displayed_count or attempts exhausted.
-    Returns set of uids found.
+    Try to read the numeric count shown in the .offer-sections .section element that contains sect_name.
+    Returns int or None if no number found within timeout.
+    """
+    end = time.time() + timeout
+    while time.time() < end:
+        try:
+            sections = driver.find_elements(By.CSS_SELECTOR, ".offer-sections .section")
+            for s in sections:
+                try:
+                    full_text = s.text.strip()
+                    # try to find a span numeric first
+                    try:
+                        span = s.find_element(By.TAG_NAME, "span")
+                        span_text = span.text.strip()
+                        if span_text.isdigit() and sect_name in full_text:
+                            return int(span_text)
+                    except Exception:
+                        # fallback to any digits in full_text
+                        m = re.search(r"(\d+)", full_text)
+                        if m and sect_name in full_text:
+                            return int(m.group(1))
+                except Exception:
+                    continue
+        except Exception:
+            pass
+        time.sleep(poll)
+    return None
+
+
+def gather_existing_offers(driver, max_scroll_attempts=10, scroll_pause=1.0):
+    """
+    Improved baseline scan:
+    - reads displayed counts reliably (with retries),
+    - clicks each section, waits for .offer-list-container,
+    - forces scrolls to trigger lazy-load up to max_scroll_attempts,
+    - stops early if found_count >= displayed_count or if found_count is stable.
+    Returns set(uid).
     """
     found_uids = set()
     section_names = [
@@ -255,37 +292,23 @@ def gather_existing_offers(driver, max_scroll_attempts=6, scroll_pause=0.8):
         "Autres communes du département"
     ]
 
-    # read displayed counts (if present) for logging
+    # read displayed counts for logging (try to be robust with retries)
     displayed_counts = {}
-    try:
-        sections = driver.find_elements(By.CSS_SELECTOR, ".offer-sections .section")
-        for s in sections:
-            try:
-                # try to retrieve the trailing numeric span
-                span = s.find_element(By.TAG_NAME, "span")
-                txt = span.text.strip()
-                # name is the text of element without span text
-                full = s.text.strip()
-                # remove span text from full to get name
-                name = full.replace(txt, "").strip()
-                displayed_counts[name] = int(txt) if txt.isdigit() else None
-            except Exception:
-                continue
-    except Exception:
-        logging.debug("Could not read displayed section counts.")
-
-    logging.info(f"Displayed section counts (if found): {displayed_counts}")
+    for sect in section_names:
+        cnt = _get_displayed_count_for_section(driver, sect, timeout=8, poll=0.5)
+        displayed_counts[sect] = cnt
+    logging.info(f"Displayed section counts (after wait): {displayed_counts}")
 
     for sect in section_names:
         btn = find_section_button(driver, sect)
         if not btn:
             logging.debug(f"Section button '{sect}' not found during baseline.")
             continue
-        click_element(driver, btn)
-        # short wait for SPA to start loading
-        time.sleep(0.8)
 
-        # attempt to load container and then trigger scrolls
+        click_element(driver, btn)
+        time.sleep(0.8)  # let SPA start loading
+
+        # wait for container presence
         try:
             container = WebDriverWait(driver, WAIT_TIMEOUT).until(
                 EC.presence_of_element_located((By.CSS_SELECTOR, ".offer-list-container"))
@@ -294,38 +317,35 @@ def gather_existing_offers(driver, max_scroll_attempts=6, scroll_pause=0.8):
             logging.info(f"No offer-list-container present for '{sect}' during baseline.")
             continue
 
+        # attempt scrolls and monitor count stability
         prev_count = -1
         stable_iterations = 0
         attempt = 0
         while attempt < max_scroll_attempts:
-            # get current cards
             cards = get_offer_cards_in_current_section(driver)
             cur_count = len(cards)
-            logging.debug(f"[baseline] section '{sect}' attempt {attempt} -> found {cur_count} cards in DOM")
+            logging.debug(f"[baseline] '{sect}' attempt {attempt+1}: found {cur_count} cards in DOM")
 
-            # if count stable for 2 iterations, consider stable
+            # stability check
             if cur_count == prev_count:
                 stable_iterations += 1
             else:
                 stable_iterations = 0
             prev_count = cur_count
 
-            # if displayed_count known and we've reached it or exceeded -> stop early
             dcount = displayed_counts.get(sect)
             if dcount is not None and cur_count >= dcount:
-                logging.info(f"[baseline] section '{sect}' reached displayed count {dcount} (found {cur_count}).")
+                logging.info(f"[baseline] '{sect}' reached displayed count {dcount} (found {cur_count}).")
                 break
 
-            # if stable for 2 iterations -> break
             if stable_iterations >= 2:
-                logging.info(f"[baseline] section '{sect}' stable after {attempt+1} attempts with {cur_count} cards.")
+                logging.info(f"[baseline] '{sect}' stable after {attempt+1} attempts with {cur_count} cards.")
                 break
 
-            # else scroll the container to bottom to trigger lazy load
+            # scroll container bottom to trigger lazy loading
             try:
                 driver.execute_script("arguments[0].scrollTop = arguments[0].scrollHeight;", container)
             except Exception:
-                # fallback: scroll window
                 try:
                     driver.execute_script("window.scrollTo(0, document.body.scrollHeight);")
                 except Exception:
@@ -334,9 +354,11 @@ def gather_existing_offers(driver, max_scroll_attempts=6, scroll_pause=0.8):
             time.sleep(scroll_pause)
             attempt += 1
 
-        # after scroll attempts, re-fetch cards and add their UIDs
+        # final fetch & log
         cards = get_offer_cards_in_current_section(driver)
-        logging.info(f"Baseline: gathered {len(cards)} cards in section '{sect}' (displayed_count={displayed_counts.get(sect)})")
+        final_count = len(cards)
+        logging.info(f"Baseline: gathered {final_count} cards in section '{sect}' (displayed_count={displayed_counts.get(sect)})")
+
         for card in cards:
             info = extract_offer_info(card)
             if info["uid"]:
@@ -434,7 +456,7 @@ def main():
         else:
             logging.info("Baseline scan found no offers (page maybe empty).")
 
-        # main polling loop (unchanged)
+        # main polling loop
         start_time = datetime.utcnow()
         end_time = start_time + timedelta(seconds=MAX_RUN_SECONDS)
         logging.info(f"Bot will run until {end_time.isoformat()} UTC (or until it finds & applies). Poll every {POLL_INTERVAL}s")
@@ -477,6 +499,7 @@ def main():
                     is_t2 = "T2" in info["typ"].upper() or "| T2" in info["typ"].upper()
                     if is_t2 and info["price"] <= 600:
                         logging.info(f"Found matching NEW offer: {info}")
+                        # open offer by clicking image
                         try:
                             img_el = card.find_element(By.CSS_SELECTOR, ".offer-image img")
                             click_element(driver, img_el)
@@ -484,6 +507,7 @@ def main():
                             logging.warning(f"Could not open offer detail: {e}")
                             continue
 
+                        # ensure still logged in before applying
                         if not is_logged_in(driver):
                             logging.warning("Session logged out just before applying. Re-authenticating...")
                             if not ensure_logged_in(driver, wait):
