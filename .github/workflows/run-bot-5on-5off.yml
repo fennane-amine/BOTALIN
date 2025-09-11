@@ -1,16 +1,18 @@
 name: AL-IN Bot 5min ON / 5min OFF (06:00-20:00 Paris)
 
+# Allow workflow to push back files (offers_seen.json / session_cookies.json)
+permissions:
+  contents: write
+
 on:
   workflow_dispatch:
-  # Cron uses UTC. We want runs every 10 minutes starting at Paris 06:00 until 19:50 (last start),
-  # Paris = UTC+2 during DST. So UTC window: 04:00 - 17:50 starts -> use minutes "*/10" and hours 4-17 UTC.
   schedule:
+    # every 10 minutes between 04:00-17:59 UTC -> corresponds to 06:00-19:59 Paris (DST aware)
     - cron: '*/10 4-17 * * *'
 
 jobs:
   run-bot:
     runs-on: ubuntu-latest
-    # give small margin above 5 minutes
     timeout-minutes: 8
     steps:
       - name: Checkout repo
@@ -32,17 +34,39 @@ jobs:
         env:
           EMAIL: ${{ secrets.EMAIL }}
           PASSWORD: ${{ secrets.PASSWORD }}
-          # force 5 minutes run
           MAX_RUN_SECONDS: 300
           POLL_INTERVAL: 15
+          HEADLESS: true
+          # optional: if you want to use PAT_FOR_PUSH instead of GITHUB_TOKEN, set it in repo secrets
+          # PAT_FOR_PUSH: ${{ secrets.PAT_FOR_PUSH }}
         run: |
           python bot.py
 
-      - name: Commit offers_seen.json if changed
+      - name: Commit offers_seen.json & session_cookies.json if changed
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PAT_FOR_PUSH: ${{ secrets.PAT_FOR_PUSH }}
         run: |
-          if [[ -f offers_seen.json ]]; then
+          # if the repo's GITHUB_TOKEN cannot push due to org policy, you can set PAT_FOR_PUSH secret (Personal Access Token)
+          if [[ -n "${PAT_FOR_PUSH}" ]]; then
+            echo "Using PAT_FOR_PUSH for pushing changes."
             git config user.name "github-actions[bot]"
             git config user.email "github-actions[bot]@users.noreply.github.com"
-            git add offers_seen.json || true
-            git diff --quiet --staged || (git commit -m "Update offers_seen.json" && git push)
+            git remote set-url origin https://x-access-token:${PAT_FOR_PUSH}@github.com/${{ github.repository }}
+          else
+            # ensure we use the default token checkout provided
+            git config user.name "github-actions[bot]"
+            git config user.email "github-actions[bot]@users.noreply.github.com"
+          fi
+
+          if [[ -f offers_seen.json || -f session_cookies.json ]]; then
+            git add offers_seen.json session_cookies.json || true
+            if ! git diff --cached --quiet; then
+              git commit -m "Update seen & session files" || true
+              git push origin HEAD || true
+            else
+              echo "No changes to commit."
+            fi
+          else
+            echo "No files to commit."
           fi
