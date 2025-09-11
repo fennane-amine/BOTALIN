@@ -266,29 +266,17 @@ def _get_displayed_count_for_section(driver, sect_name, timeout=12, poll=0.5):
 
 
 def _progressive_scroll_container_to_bottom(driver, container, max_attempts=30, pause=0.8):
-    """
-    Aggressively scroll the container to its bottom by:
-    - setting scrollTop to scrollHeight,
-    - doing small incremental scrolls (simulate user),
-    - scrolling the window as fallback.
-    Stop when card count stabilizes for several iterations or attempts exhausted.
-    Returns after attempts.
-    """
     prev_counts = []
     attempt = 0
     while attempt < max_attempts:
         try:
-            # try to set to bottom
             driver.execute_script("arguments[0].scrollTop = arguments[0].scrollHeight;", container)
         except Exception:
             try:
                 driver.execute_script("window.scrollTo(0, document.body.scrollHeight);")
             except Exception:
                 pass
-
-        # extra progressive scroll: small steps to trigger lazy loads
         try:
-            # run a tiny JS loop that scrolls down a few steps (helps some virtualized lists)
             js = """
             const c = arguments[0];
             const steps = 6;
@@ -301,30 +289,19 @@ def _progressive_scroll_container_to_bottom(driver, container, max_attempts=30, 
             driver.execute_script(js, container)
         except Exception:
             pass
-
         time.sleep(pause)
         cards = get_offer_cards_in_current_section(driver)
         cur_count = len(cards)
         prev_counts.append(cur_count)
         if len(prev_counts) > 5:
             prev_counts.pop(0)
-        # if stable for 4 iterations => done
         if len(prev_counts) >= 4 and all(x == prev_counts[0] for x in prev_counts):
-            logging.debug(f"Container scroll stable after {attempt+1} attempts with {cur_count} cards.")
             break
         attempt += 1
     return
 
 
 def gather_existing_offers(driver, max_scroll_attempts=40, scroll_pause=0.8):
-    """
-    Very aggressive baseline:
-    - read displayed counts (with retries)
-    - click each section
-    - wait for the .offer-list-container, then force progressive scrolling *inside* the container and window
-    - stop when found count stabilizes or when displayed_count reached
-    """
-    # ensure top of page for predictable rendering
     try:
         driver.execute_script("window.scrollTo(0,0);")
     except Exception:
@@ -340,28 +317,20 @@ def gather_existing_offers(driver, max_scroll_attempts=40, scroll_pause=0.8):
     displayed_counts = {}
     for sect in section_names:
         displayed_counts[sect] = _get_displayed_count_for_section(driver, sect, timeout=12, poll=0.5)
-    logging.info(f"Displayed section counts (after wait): {displayed_counts}")
 
     for sect in section_names:
         btn = find_section_button(driver, sect)
         if not btn:
-            logging.debug(f"Section button '{sect}' not found during baseline.")
             continue
-
         click_element(driver, btn)
-        # allow SPA to start updating
         time.sleep(1.0)
-
         try:
             container = WebDriverWait(driver, WAIT_TIMEOUT).until(
                 EC.presence_of_element_located((By.CSS_SELECTOR, ".offer-list-container"))
             )
         except TimeoutException:
-            logging.info(f"No offer-list-container present for '{sect}' during baseline.")
             continue
 
-        # aggressive strategy: multiple scroll methods + container progressive scrolling
-        # 1) do several full window scrolls
         for i in range(3):
             try:
                 driver.execute_script("window.scrollTo(0, document.body.scrollHeight);")
@@ -369,10 +338,8 @@ def gather_existing_offers(driver, max_scroll_attempts=40, scroll_pause=0.8):
                 pass
             time.sleep(0.4)
 
-        # 2) progressive scroll inside container (major effort)
         _progressive_scroll_container_to_bottom(driver, container, max_attempts=max_scroll_attempts, pause=scroll_pause)
 
-        # 3) small extra attempts of window scroll + wait
         for i in range(4):
             try:
                 driver.execute_script("window.scrollTo(0, document.body.scrollHeight);")
@@ -380,7 +347,6 @@ def gather_existing_offers(driver, max_scroll_attempts=40, scroll_pause=0.8):
                 pass
             time.sleep(scroll_pause)
 
-        # 4) final stabilization: sample counts until stable or attempts exhausted
         prev_counts = []
         attempts = 0
         while attempts < 6:
@@ -390,20 +356,17 @@ def gather_existing_offers(driver, max_scroll_attempts=40, scroll_pause=0.8):
             if len(prev_counts) > 4:
                 prev_counts.pop(0)
             if len(prev_counts) >= 3 and prev_counts[-1] == prev_counts[-2] == prev_counts[-3]:
-                logging.debug(f"Final stabilization for '{sect}' with {cur_count} cards.")
                 break
             time.sleep(0.6)
             attempts += 1
 
-        # final fetch & log
         cards = get_offer_cards_in_current_section(driver)
-        final_count = len(cards)
-        logging.info(f"Baseline: gathered {final_count} cards in section '{sect}' (displayed_count={displayed_counts.get(sect)})")
-
         for card in cards:
             info = extract_offer_info(card)
             if info["uid"]:
                 found_uids.add(info["uid"])
+        # --- stop after first section processed to speed up baseline ---
+        break
 
     return found_uids
 
@@ -435,194 +398,146 @@ def perform_login(driver, wait):
             btn = wait.until(EC.element_to_be_clickable((By.XPATH, "//button[contains(.,'JE ME CONNECTE') or contains(.,'Je me connecte')]")))
             btn.click()
         except TimeoutException:
-            logging.error("Login button not found during perform_login.")
             return False
         wait.until(EC.presence_of_element_located((By.CSS_SELECTOR, ".offer-sections")))
-        logging.info("Login successful.")
         save_cookies(driver)
         return True
-    except Exception as e:
-        logging.error(f"Login process failed: {e}")
+    except Exception:
         return False
 
 
 def ensure_logged_in(driver, wait):
     if is_logged_in(driver):
         return True
-    logging.info("Not logged in. Trying to load cookies if available.")
     try:
         loaded = load_cookies_to_driver(driver)
         if loaded and is_logged_in(driver):
-            logging.info("Logged in after loading cookies.")
             return True
-    except Exception as e:
-        logging.debug(f"Loading cookies raised: {e}")
-    logging.info("Performing full login with credentials.")
-    ok = perform_login(driver, wait)
-    if not ok:
-        logging.error("Full login failed.")
-    return ok
+    except Exception:
+        pass
+    return perform_login(driver, wait)
 
 
 # ---------- Main ----------
 def main():
-    logging.info("Starting bot")
     seen = load_seen()
-    logging.info(f"Loaded {len(seen)} seen offers (from {SEEN_FILE} if present)")
-
     try:
         driver = init_driver()
-    except Exception as e:
-        logging.error(f"Driver init failed: {e}")
+    except Exception:
         return
 
     wait = WebDriverWait(driver, WAIT_TIMEOUT)
-    try:
-        if not ensure_logged_in(driver, wait):
-            logging.error("Could not authenticate; stopping run.")
-            return
+    if not ensure_logged_in(driver, wait):
+        return
 
-        # aggressive baseline gather
-        existing = gather_existing_offers(driver)
-        if existing:
-            new_count = 0
-            for uid in existing:
-                if uid not in seen:
-                    seen.add(uid)
-                    new_count += 1
-            if new_count:
-                save_seen(seen)
-            logging.info(f"Baseline: added {new_count} current offers to seen. Total seen now: {len(seen)}")
-        else:
-            logging.info("Baseline scan found no offers (page maybe empty).")
+    existing = gather_existing_offers(driver)
+    for uid in existing:
+        if uid not in seen:
+            seen.add(uid)
+    save_seen(seen)
 
-        start_time = datetime.utcnow()
-        end_time = start_time + timedelta(seconds=MAX_RUN_SECONDS)
-        logging.info(f"Bot will run until {end_time.isoformat()} UTC (or until it finds & applies). Poll every {POLL_INTERVAL}s")
+    start_time = datetime.utcnow()
+    end_time = start_time + timedelta(seconds=MAX_RUN_SECONDS)
 
-        section_names = [
-            "Communes demandées",
-            "Communes limitrophes",
-            "Autres communes du département"
-        ]
+    section_names = [
+        "Communes demandées",
+        "Communes limitrophes",
+        "Autres communes du département"
+    ]
 
-        while datetime.utcnow() < end_time:
-            if not is_logged_in(driver):
-                logging.warning("Session appears logged out during run. Re-authenticating...")
-                if not ensure_logged_in(driver, wait):
-                    logging.error("Re-authentication failed; aborting this run.")
-                    break
+    while datetime.utcnow() < end_time:
+        if not is_logged_in(driver):
+            if not ensure_logged_in(driver, wait):
+                break
 
-            applied = False
-            for sect in section_names:
-                logging.info(f"Selecting section '{sect}'")
-                btn = find_section_button(driver, sect)
-                if not btn:
-                    logging.warning(f"Section '{sect}' not found; skipping")
+        applied = False
+        for sect in section_names:
+            btn = find_section_button(driver, sect)
+            if not btn:
+                continue
+            click_element(driver, btn)
+            time.sleep(1)
+            cards = get_offer_cards_in_current_section(driver)
+            for card in cards:
+                info = extract_offer_info(card)
+                uid = info["uid"]
+                if not uid or uid in seen:
                     continue
-                click_element(driver, btn)
-                time.sleep(1)
+                if info["price"] is None:
+                    continue
+                is_t2 = "T2" in info["typ"].upper() or "| T2" in info["typ"].upper()
+                if is_t2 and info["price"] <= 600:
+                    try:
+                        img_el = card.find_element(By.CSS_SELECTOR, ".offer-image img")
+                        click_element(driver, img_el)
+                    except Exception:
+                        continue
 
-                cards = get_offer_cards_in_current_section(driver)
-                logging.info(f"Found {len(cards)} cards in '{sect}'")
-                for card in cards:
-                    info = extract_offer_info(card)
-                    uid = info["uid"]
-                    logging.debug(f"Offer uid={uid} price={info['price']} typ={info['typ']} loc={info['loc']}")
-                    if not uid or uid in seen:
-                        continue
-                    if info["price"] is None:
-                        continue
-                    is_t2 = "T2" in info["typ"].upper() or "| T2" in info["typ"].upper()
-                    if is_t2 and info["price"] <= 600:
-                        logging.info(f"Found matching NEW offer: {info}")
-                        try:
-                            img_el = card.find_element(By.CSS_SELECTOR, ".offer-image img")
-                            click_element(driver, img_el)
-                        except Exception as e:
-                            logging.warning(f"Could not open offer detail: {e}")
+                    if not is_logged_in(driver):
+                        if not ensure_logged_in(driver, wait):
                             continue
 
-                        if not is_logged_in(driver):
-                            logging.warning("Session logged out just before applying. Re-authenticating...")
-                            if not ensure_logged_in(driver, wait):
-                                logging.error("Re-authentication failed; cannot apply.")
-                                continue
-
+                    try:
+                        apply_btn = WebDriverWait(driver, WAIT_TIMEOUT).until(
+                            EC.element_to_be_clickable((By.XPATH, "//button[contains(.,'Je postule') or contains(.,'JE POSTULE') or contains(.,'Je postuler')]"))
+                        )
+                        apply_btn.click()
+                    except TimeoutException:
                         try:
-                            apply_btn = WebDriverWait(driver, WAIT_TIMEOUT).until(
-                                EC.element_to_be_clickable((By.XPATH, "//button[contains(.,'Je postule') or contains(.,'JE POSTULE') or contains(.,'Je postuler')]"))
-                            )
+                            apply_btn = driver.find_element(By.CSS_SELECTOR, ".btn-secondary.hi-check-round")
                             apply_btn.click()
-                            logging.info("Clicked 'Je postule'")
-                        except TimeoutException:
-                            logging.warning("Apply button not found (timeout). Trying alternative selectors.")
-                            try:
-                                apply_btn = driver.find_element(By.CSS_SELECTOR, ".btn-secondary.hi-check-round")
-                                apply_btn.click()
-                            except Exception as e:
-                                logging.error(f"Failed to click apply: {e}")
-                                continue
+                        except Exception:
+                            continue
 
-                        try:
-                            confirm_btn = WebDriverWait(driver, WAIT_TIMEOUT).until(
-                                EC.element_to_be_clickable((By.XPATH, "//button[contains(.,'Confirmer')]"))
-                            )
-                            confirm_btn.click()
-                            logging.info("Clicked 'Confirmer'")
-                        except TimeoutException:
-                            logging.warning("Confirm button not found (maybe not required)")
+                    try:
+                        confirm_btn = WebDriverWait(driver, WAIT_TIMEOUT).until(
+                            EC.element_to_be_clickable((By.XPATH, "//button[contains(.,'Confirmer')]"))
+                        )
+                        confirm_btn.click()
+                    except TimeoutException:
+                        pass
 
-                        try:
-                            ok_btn = WebDriverWait(driver, WAIT_TIMEOUT).until(
-                                EC.element_to_be_clickable((By.XPATH, "//button[normalize-space(.)='Ok' or contains(.,'Ok') or contains(.,'OK')]"))
-                            )
-                            ok_btn.click()
-                            logging.info("Clicked 'Ok'")
-                        except TimeoutException:
-                            logging.warning("Ok button not found (maybe not required)")
+                    try:
+                        ok_btn = WebDriverWait(driver, WAIT_TIMEOUT).until(
+                            EC.element_to_be_clickable((By.XPATH, "//button[normalize-space(.)='Ok' or contains(.,'Ok') or contains(.,'OK')]"))
+                        )
+                        ok_btn.click()
+                    except TimeoutException:
+                        pass
 
-                        try:
-                            txt = WebDriverWait(driver, WAIT_TIMEOUT).until(
-                                EC.presence_of_element_located((By.CSS_SELECTOR, ".text_picto_vert"))
-                            )
-                            val = txt.text.strip()
-                            logging.info(f"Application result text: {val}")
-                            seen.add(uid)
-                            save_seen(seen)
-                            save_cookies(driver)
-                            applied = True
-                            break
-                        except TimeoutException:
-                            logging.warning("Result text not found; still saving seen and continuing.")
-                            seen.add(uid)
-                            save_seen(seen)
-                            save_cookies(driver)
-                            applied = True
-                            break
-
-                if applied:
-                    break
-
+                    try:
+                        txt = WebDriverWait(driver, WAIT_TIMEOUT).until(
+                            EC.presence_of_element_located((By.CSS_SELECTOR, ".text_picto_vert"))
+                        )
+                        val = txt.text.strip()
+                        seen.add(uid)
+                        save_seen(seen)
+                        save_cookies(driver)
+                        applied = True
+                        break
+                    except TimeoutException:
+                        seen.add(uid)
+                        save_seen(seen)
+                        save_cookies(driver)
+                        applied = True
+                        break
+            # --- stop after first offer applied ---
             if applied:
-                logging.info("Applied to an offer; stopping this run.")
                 break
 
-            remaining = (end_time - datetime.utcnow()).total_seconds()
-            if remaining <= 0:
-                break
-            sleep_for = min(POLL_INTERVAL, max(0, remaining))
-            logging.info(f"No matching offers found. Sleeping {sleep_for}s before next poll...")
-            time.sleep(sleep_for)
+        if applied:
+            break
 
-        logging.info("Bot finished run.")
-    except Exception as e:
-        logging.error(f"Unhandled error in main loop: {e}")
-    finally:
-        try:
-            driver.quit()
-        except Exception:
-            pass
+        remaining = (end_time - datetime.utcnow()).total_seconds()
+        if remaining <= 0:
+            break
+        sleep_for = min(POLL_INTERVAL, max(0, remaining))
+        time.sleep(sleep_for)
+
+    try:
+        driver.quit()
+    except Exception:
+        pass
 
 
 if __name__ == "__main__":
