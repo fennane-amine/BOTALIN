@@ -1,70 +1,57 @@
-import logging
 import time
+import logging
 from selenium import webdriver
-from selenium.webdriver.chrome.options import Options
 from selenium.webdriver.common.by import By
+from selenium.webdriver.chrome.service import Service
+from selenium.webdriver.chrome.options import Options
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
 
 # ------------------ CONFIG ------------------
 EMAIL = "mohamed-amine.fennane@epita.fr"
 PASSWORD = "&9.Mnq.6F8'M/wm{"
-URL_LOGIN = "https://www.al-in.fr/login"
-URL_COMMUNES = "https://www.al-in.fr/mes-demandes/communes-demandees"
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
 # ------------------ INIT DRIVER ------------------
 def init_driver():
     options = Options()
-    options.add_argument("--headless=new")
-    options.add_argument("--disable-gpu")
-    options.add_argument("--no-sandbox")
-    options.add_argument("--disable-dev-shm-usage")
-    options.add_argument("--disable-blink-features=AutomationControlled")
     options.add_argument("--start-maximized")
+    options.add_argument("--disable-notifications")
     driver = webdriver.Chrome(options=options)
-    driver.implicitly_wait(5)
     return driver
 
 # ------------------ LOGIN ------------------
 def login(driver):
-    driver.get(URL_LOGIN)
     logging.info("Opening login page...")
+    driver.get("https://example-login-page.com")  # <- mettre l'URL de login réel
+    WebDriverWait(driver, 10).until(EC.presence_of_element_located((By.NAME, "email"))).send_keys(EMAIL)
+    driver.find_element(By.NAME, "password").send_keys(PASSWORD)
+    driver.find_element(By.XPATH, "//button[contains(text(),'Se connecter')]").click()
+    logging.info("Login attempted")
+    time.sleep(3)  # attente pour chargement complet
 
+# ------------------ NAVIGATION ------------------
+def go_to_communes_limitrophes(driver):
+    logging.info("Navigating to 'Communes limitrophes' section...")
     try:
-        email_input = WebDriverWait(driver, 30).until(
-            EC.visibility_of_element_located((By.NAME, "email"))
+        section_btn = WebDriverWait(driver, 10).until(
+            EC.element_to_be_clickable((By.XPATH, "//div[contains(text(),'Communes limitrophes')]"))
         )
-        email_input.send_keys(EMAIL)
-
-        password_input = driver.find_element(By.NAME, "password")
-        password_input.send_keys(PASSWORD)
-
-        driver.find_element(By.XPATH, "//button[contains(text(),'Se connecter')]").click()
-        logging.info("Login submitted, waiting for dashboard...")
-
-        WebDriverWait(driver, 30).until(EC.url_contains("dashboard"))
-        logging.info("Login successful!")
-
+        section_btn.click()
+        logging.info("'Communes limitrophes' section opened")
+        time.sleep(2)
     except Exception as e:
-        logging.error("Login failed: %s", e)
-        driver.quit()
-        raise
-
-# ------------------ NAVIGATE TO COMMUNES ------------------
-def go_to_communes(driver):
-    driver.get(URL_COMMUNES)
-    logging.info("Navigated to Communes demandées page")
+        logging.error("Failed to open 'Communes limitrophes': %s", e)
 
 # ------------------ POSTULE FIRST OFFER ------------------
 def postule_first_offer(driver):
     try:
-        # Scroll down pour s'assurer que les cartes se chargent
+        # Scroll pour charger les offres
         driver.execute_script("window.scrollTo(0, document.body.scrollHeight);")
         time.sleep(2)
 
-        # Cherche la première offre
+        # Cherche la première offre dans la section
         first_offer = WebDriverWait(driver, 10).until(
             EC.element_to_be_clickable((By.CSS_SELECTOR, ".offer-card-container"))
         )
@@ -88,7 +75,7 @@ def postule_first_offer(driver):
         logging.info("'Confirmer' clicked")
         time.sleep(2)
 
-        # Final pop-up OK
+        # Pop-up final OK
         ok_btn = WebDriverWait(driver, 10).until(
             EC.element_to_be_clickable((By.XPATH, "//button[contains(text(),'Ok')]"))
         )
@@ -103,7 +90,7 @@ def main():
     driver = init_driver()
     try:
         login(driver)
-        go_to_communes(driver)
+        go_to_communes_limitrophes(driver)
         postule_first_offer(driver)
     finally:
         logging.info("Closing browser...")
