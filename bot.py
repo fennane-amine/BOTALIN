@@ -3,13 +3,11 @@ import json
 import time
 import logging
 from selenium import webdriver
-from selenium.webdriver.chrome.service import Service
 from selenium.webdriver.chrome.options import Options
 from selenium.webdriver.common.by import By
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
 from selenium.common.exceptions import TimeoutException
-from webdriver_manager.chrome import ChromeDriverManager
 
 # ---------- Config ----------
 WAIT_TIMEOUT = 15
@@ -30,8 +28,10 @@ def init_driver():
     options.add_argument("--disable-dev-shm-usage")
     options.add_argument("--disable-blink-features=AutomationControlled")
     options.add_argument("--headless=new")
-    service = Service(ChromeDriverManager().install())
-    driver = webdriver.Chrome(service=service, options=options)
+
+    logging.info("Trying Selenium Manager (webdriver.Chrome(options=...))")
+    driver = webdriver.Chrome(options=options)  # Selenium Manager gère tout
+    logging.info("Selenium Manager initialized Chrome successfully.")
     return driver
 
 # ---------- Cookies ----------
