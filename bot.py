@@ -1,7 +1,6 @@
 import time
 import logging
 import smtplib
-import tempfile
 from email.mime.text import MIMEText
 from selenium import webdriver
 from selenium.webdriver.common.by import By
@@ -45,10 +44,6 @@ def init_driver():
     options.add_argument("--start-maximized")
     options.add_argument("--disable-notifications")
     options.add_argument("--disable-popup-blocking")
-
-    # ✅ Fix: unique Chrome profile à chaque lancement
-    temp_user_data_dir = tempfile.mkdtemp()
-    options.add_argument(f"--user-data-dir={temp_user_data_dir}")
 
     logging.info("Trying Selenium Manager (webdriver.Chrome(options=...))")
     driver = webdriver.Chrome(options=options)
@@ -97,6 +92,7 @@ def find_and_apply(driver):
                 driver.execute_script("arguments[0].scrollIntoView(true);", apply_btn)
                 time.sleep(1)
                 driver.execute_script("arguments[0].click();", apply_btn)
+                logging.info("Clicked 'Je postule'")
 
                 # confirmer
                 confirm_btn = WebDriverWait(driver, 10).until(
