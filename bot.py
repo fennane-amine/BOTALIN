@@ -38,20 +38,28 @@ def init_driver():
 def login(driver):
     driver.get(LOGIN_URL)
     try:
-        WebDriverWait(driver, 20).until(
-            EC.presence_of_element_located((By.NAME, "email"))
+        # attendre le champ email
+        email_field = WebDriverWait(driver, 20).until(
+            EC.presence_of_element_located((By.CSS_SELECTOR, "input[type='email']"))
         )
-        email_field = driver.find_element(By.NAME, "email")
-        pwd_field = driver.find_element(By.NAME, "password")
-        email_field.send_keys(EMAIL)
-        pwd_field.send_keys(PASSWORD)
-        pwd_field.send_keys(Keys.RETURN)
+        pwd_field = driver.find_element(By.CSS_SELECTOR, "input[type='password']")
 
+        email_field.clear()
+        email_field.send_keys(EMAIL)
+        pwd_field.clear()
+        pwd_field.send_keys(PASSWORD)
+
+        # bouton de connexion
+        login_btn = driver.find_element(By.CSS_SELECTOR, "button[type='submit']")
+        login_btn.click()
+
+        # attendre que les offres apparaissent après login
         WebDriverWait(driver, 20).until(
             EC.presence_of_element_located((By.CSS_SELECTOR, "div.offer-card-container"))
         )
         logging.info("Login successful.")
         return True
+
     except TimeoutException:
         logging.error("Login failed.")
         return False
