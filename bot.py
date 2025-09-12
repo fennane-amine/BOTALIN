@@ -12,8 +12,8 @@ from selenium.webdriver.support import expected_conditions as EC
 LOGIN_URL = "https://candidat.pole-emploi.fr/espacepersonnel/"
 SEARCH_URL = "https://candidat.pole-emploi.fr/offres/recherche?lieux=75112"
 
-USERNAME = "ton_email"      # ⚠️ à remplacer
-PASSWORD = "ton_password"   # ⚠️ à remplacer
+USERNAME = "mohamed-amine.fennane@epita.fr"      # ⚠️ à remplacer
+PASSWORD = "&9.Mnq.6F8'M/wm{"   # ⚠️ à remplacer
 
 logging.basicConfig(
     level=logging.INFO,
