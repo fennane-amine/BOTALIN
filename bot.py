@@ -1,134 +1,119 @@
 import time
 import logging
-import smtplib
-from email.mime.text import MIMEText
 from selenium import webdriver
 from selenium.webdriver.common.by import By
-from selenium.webdriver.chrome.options import Options
+from selenium.webdriver.common.keys import Keys
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
+from selenium.common.exceptions import TimeoutException
 
-# 📌 Config logs
+# -------------------------------------------------------------------
+# CONFIGURATION
+# -------------------------------------------------------------------
+EMAIL = "tesstedsgstsredr@gmail.com"
+PASSWORD = "tesstedsgstsredr@gmail.com1212"
+LOGIN_URL = "https://al-in.fr/auth/login"
+
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s - %(levelname)s - %(message)s"
 )
 
-# 📌 Config email
-SMTP_SERVER = "smtp.gmail.com"
-SMTP_PORT = 587
-EMAIL_SENDER = "tesstedsgstsredr@gmail.com"
-EMAIL_PASSWORD = "tesstedsgstsredr@gmail.com1212"
-EMAIL_RECEIVER = "fennane.mohamedamine@gmail.com"
-
-
-def send_email(subject, body):
-    try:
-        msg = MIMEText(body)
-        msg["Subject"] = subject
-        msg["From"] = EMAIL_SENDER
-        msg["To"] = EMAIL_RECEIVER
-
-        with smtplib.SMTP(SMTP_SERVER, SMTP_PORT) as server:
-            server.starttls()
-            server.login(EMAIL_SENDER, EMAIL_PASSWORD)
-            server.sendmail(EMAIL_SENDER, EMAIL_RECEIVER, msg.as_string())
-
-        logging.info("✅ Email sent successfully")
-    except Exception as e:
-        logging.error(f"❌ Failed to send email: {e}")
-
-
+# -------------------------------------------------------------------
+# INITIALISATION DU DRIVER
+# -------------------------------------------------------------------
 def init_driver():
-    options = Options()
-    options.add_argument("--start-maximized")
-    options.add_argument("--disable-notifications")
-    options.add_argument("--disable-popup-blocking")
-
-    logging.info("Trying Selenium Manager (webdriver.Chrome(options=...))")
+    logging.info("Starting bot")
+    options = webdriver.ChromeOptions()
+    options.add_argument("--no-sandbox")
+    options.add_argument("--disable-dev-shm-usage")
+    options.add_argument("--headless=new")  # mode headless
     driver = webdriver.Chrome(options=options)
+    driver.set_window_size(1280, 1024)
     return driver
 
-
+# -------------------------------------------------------------------
+# LOGIN
+# -------------------------------------------------------------------
 def login(driver):
-    driver.get("https://al-in.fr/locataire/connexion")
+    driver.get(LOGIN_URL)
+    try:
+        WebDriverWait(driver, 20).until(
+            EC.presence_of_element_located((By.NAME, "email"))
+        )
+        email_field = driver.find_element(By.NAME, "email")
+        pwd_field = driver.find_element(By.NAME, "password")
+        email_field.send_keys(EMAIL)
+        pwd_field.send_keys(PASSWORD)
+        pwd_field.send_keys(Keys.RETURN)
 
-    WebDriverWait(driver, 20).until(
-        EC.presence_of_element_located((By.NAME, "email"))
-    ).send_keys("ton.email@login.com")
+        WebDriverWait(driver, 20).until(
+            EC.presence_of_element_located((By.CSS_SELECTOR, "div.offer-card-container"))
+        )
+        logging.info("Login successful.")
+        return True
+    except TimeoutException:
+        logging.error("Login failed.")
+        return False
 
-    driver.find_element(By.NAME, "password").send_keys("tonpassword")
-    driver.find_element(By.CSS_SELECTOR, "button[type=submit]").click()
+# -------------------------------------------------------------------
+# CHERCHE ET POSTULE SUR UNE OFFRE
+# -------------------------------------------------------------------
+def search_and_apply_offer(driver):
+    logging.info("Searching for offers...")
 
-    WebDriverWait(driver, 20).until(
-        EC.presence_of_element_located((By.CLASS_NAME, "navbar"))
-    )
-    logging.info("Login successful.")
-
-
-def find_and_apply(driver):
     offers = driver.find_elements(By.CSS_SELECTOR, "div.offer-card-container")
-
     for offer in offers:
         try:
-            loc = offer.find_element(By.CSS_SELECTOR, "div.location").text.strip()
-            if "Choisy-le-Roi" in loc:
-                price_text = offer.find_element(By.CSS_SELECTOR, "div.price").text.strip()
-                typ = offer.find_element(By.CSS_SELECTOR, "div.typology").text.strip()
-                img_src = offer.find_element(By.CSS_SELECTOR, "img").get_attribute("src")
+            price_text = offer.find_element(By.CSS_SELECTOR, ".price").text
+            typ = offer.find_element(By.CSS_SELECTOR, ".typology").text
+            loc = offer.find_element(By.CSS_SELECTOR, ".location").text
+            img = offer.find_element(By.CSS_SELECTOR, ".offer-image img").get_attribute("src")
 
+            # 🎯 Filtre : Choisy-le-Roi
+            if "Choisy-le-Roi" in loc:
                 target_offer = {
-                    "uid": img_src,
-                    "img_src": img_src,
+                    "uid": img,
+                    "img_src": img,
                     "price_text": price_text,
                     "typ": typ,
-                    "loc": loc,
+                    "loc": loc
                 }
-
                 logging.info(f"Found target offer: {target_offer}")
 
-                # clique bouton "Je postule"
-                apply_btn = offer.find_element(By.CSS_SELECTOR, "button.btn.btn-secondary")
+                # Trouver le bouton "Postuler"
+                apply_btn = offer.find_element(By.CSS_SELECTOR, "button.btn-secondary")
+
+                # ✅ Correction : scroller et forcer clic JS
                 driver.execute_script("arguments[0].scrollIntoView(true);", apply_btn)
                 time.sleep(1)
                 driver.execute_script("arguments[0].click();", apply_btn)
-                logging.info("Clicked 'Je postule'")
 
-                # confirmer
-                confirm_btn = WebDriverWait(driver, 10).until(
-                    EC.element_to_be_clickable((By.XPATH, "//button[contains(text(),'Confirmer')]"))
-                )
-                confirm_btn.click()
-                logging.info("Clicked 'Confirmer'")
-
-                # ok final
-                ok_btn = WebDriverWait(driver, 10).until(
-                    EC.element_to_be_clickable((By.XPATH, "//button[contains(text(),'Ok')]"))
-                )
-                ok_btn.click()
-                logging.info("Clicked 'Ok'")
-
-                # ✅ send email notification
-                send_email(
-                    subject="Bot AL-IN : Candidature envoyée ✅",
-                    body=f"L'offre suivante a été traitée :\n\n{target_offer}"
-                )
-
-                return
+                logging.info("Clicked on apply button successfully.")
+                return True
         except Exception as e:
-            logging.error(f"Erreur en traitant une offre: {e}")
+            logging.warning(f"Error processing offer: {e}")
+            continue
 
+    logging.info("No matching offer found.")
+    return False
 
+# -------------------------------------------------------------------
+# MAIN
+# -------------------------------------------------------------------
 def main():
-    logging.info("Starting bot")
     driver = init_driver()
     try:
-        login(driver)
-        find_and_apply(driver)
-        logging.info("Bot finished successfully.")
+        if login(driver):
+            applied = search_and_apply_offer(driver)
+            if applied:
+                logging.info("Application done.")
+            else:
+                logging.info("No application submitted.")
+        else:
+            logging.error("Could not log in.")
     finally:
         driver.quit()
-
 
 if __name__ == "__main__":
     main()
