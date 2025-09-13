@@ -1,11 +1,23 @@
 # bot.py - watcher + apply + email notifications (priority: Communes demandées, max price 600)
+# USAGE:
+# - Set site credentials in environment: EMAIL, PASSWORD
+# - Set SMTP creds in environment: SENDER_EMAIL, SENDER_PASS (recommended)
+# - Optionally set HEADLESS, MAX_RUN_SECONDS, POLL_INTERVAL
+#
+# Gmail notes:
+# - If using a Gmail account for SENDER_EMAIL, you must create an App Password (account with 2FA),
+#   then set that app password in SENDER_PASS. Without that Gmail will refuse (535 BadCredentials).
+# - Alternatively use a transactional email provider (SendGrid/Mailgun/etc.)
+#
+# This script will NOT crash if SMTP auth fails: it logs the problem and continues.
+
 import os
 import time
 import json
 import re
 import logging
-import smtplib
 import stat
+import smtplib
 from datetime import datetime, timedelta
 from email.message import EmailMessage
 
@@ -13,7 +25,7 @@ from selenium import webdriver
 from selenium.webdriver.common.by import By
 from selenium.webdriver.chrome.options import Options
 from selenium.webdriver.chrome.service import Service
-from selenium.common.exceptions import TimeoutException, ElementClickInterceptedException
+from selenium.common.exceptions import TimeoutException, ElementClickInterceptedException, WebDriverException
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
 
@@ -23,14 +35,14 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(
 
 # ---------- CONFIG ----------
 BASE_URL = "https://al-in.fr/#/connexion-demandeur"
-# Site credentials (kept as before)
+# site login (keep as env)
 EMAIL = os.environ.get("EMAIL") or "mohamed-amine.fennane@epita.fr"
 PASSWORD = os.environ.get("PASSWORD") or "&9.Mnq.6F8'M/wm{"
 
-# SMTP credentials (as requested)
-SENDER_EMAIL = "tesstedsgstsredr@gmail.com"
-SENDER_PASS = "tesstedsgstsredr@gmail.com1212"
-RECIPIENT_EMAIL = "fennane.mohamedamine@gmail.com"
+# SMTP / notification
+SENDER_EMAIL = os.environ.get("SENDER_EMAIL") or "tesstedsgstsredr@gmail.com"
+SENDER_PASS = "usdd czjy zsnq iael" or "tesstedsgstsredr@gmail.com1212"  # prefer env var for security
+RECIPIENT_EMAIL = os.environ.get("RECIPIENT_EMAIL") or "fennane.mohamedamine@gmail.com"
 
 WAIT_TIMEOUT = 12
 HEADLESS = os.environ.get("HEADLESS", "true").lower() in ("1", "true", "yes")
@@ -38,44 +50,65 @@ SEEN_FILE = "offers_seen.json"
 MAX_RUN_SECONDS = int(os.environ.get("MAX_RUN_SECONDS", 300))
 POLL_INTERVAL = int(os.environ.get("POLL_INTERVAL", 15))
 
-# Matching criteria (updated)
+# Matching criteria
 MAX_PRICE = 600
 WANTED_TYPOLOGY_KEY = "T2"
 
-# Retry / scroll settings
+# Scrolling / retries
 CLICK_RETRIES = 5
 SCROLL_PAUSE = 0.6
 CONTAINER_SCROLL_ATTEMPTS = 30
 
+# Basic sanity
 if not EMAIL or not PASSWORD:
-    logging.error("EMAIL and PASSWORD must be set (site credentials).")
+    logging.error("Site EMAIL and PASSWORD must be set.")
     raise SystemExit(1)
 
 
-# ---------- Helpers ----------
+# ---------- Email helper (robust) ----------
 def send_email(subject: str, body: str):
-    """Send notification email (simple SMTP TLS)."""
-    try:
-        msg = EmailMessage()
-        msg["From"] = SENDER_EMAIL
-        msg["To"] = RECIPIENT_EMAIL
-        msg["Subject"] = subject
-        msg.set_content(body)
+    """Send email via SMTP TLS. On failure logs error and returns False."""
+    msg = EmailMessage()
+    msg["From"] = SENDER_EMAIL
+    msg["To"] = RECIPIENT_EMAIL
+    msg["Subject"] = subject
+    msg.set_content(body)
 
+    # Try TLS (587) first, then SSL(465) fallback
+    try:
         with smtplib.SMTP("smtp.gmail.com", 587, timeout=20) as s:
+            s.ehlo()
             s.starttls()
             s.login(SENDER_EMAIL, SENDER_PASS)
             s.send_message(msg)
-        logging.info("Notification email sent.")
+        logging.info("Notification email sent via smtp.gmail.com:587")
+        return True
+    except smtplib.SMTPAuthenticationError as e:
+        logging.warning(f"SMTP auth failed (TLS): {e}")
     except Exception as e:
-        logging.warning(f"Failed to send notification email: {e}")
+        logging.warning(f"SMTP TLS send failed: {e}")
+
+    # fallback to SSL port 465
+    try:
+        with smtplib.SMTP_SSL("smtp.gmail.com", 465, timeout=20) as s:
+            s.login(SENDER_EMAIL, SENDER_PASS)
+            s.send_message(msg)
+        logging.info("Notification email sent via smtp.gmail.com:465")
+        return True
+    except smtplib.SMTPAuthenticationError as e:
+        logging.warning(f"SMTP auth failed (SSL): {e}")
+    except Exception as e:
+        logging.warning(f"SMTP SSL send failed: {e}")
+
+    logging.error("All attempts to send notification email failed. Check SMTP credentials / app password.")
+    return False
 
 
+# ---------- Helpers ----------
 def load_seen():
     try:
         with open(SEEN_FILE, "r", encoding="utf-8") as f:
-            data = json.load(f)
-            return set(data)
+            return set(json.load(f))
     except Exception:
         return set()
 
@@ -207,7 +240,6 @@ def init_driver():
     options.add_argument("--no-sandbox")
     options.add_argument("--disable-dev-shm-usage")
     options.add_argument("--window-size=1920,1080")
-
     # unique profile to avoid "user data directory is already in use"
     options.add_argument(f"--user-data-dir=/tmp/chrome_user_data_{os.getpid()}")
 
@@ -334,9 +366,7 @@ def robust_click_apply_flow(driver, wait):
         return True, "applied_but_no_text"
 
 
-# ---------- Section scanning helper ----------
 def find_matching_offers_in_section(driver, wait, seen, section_name):
-    """Return list of (card, info) that match criteria and are not seen."""
     found = []
     btn = find_section_button(driver, section_name)
     if not btn:
@@ -387,24 +417,20 @@ def main():
             send_email("BOTALIN - Login failed", "The bot could not log in with provided credentials.")
             return
 
-        # Priority: Communes demandées first
         sections_priority = [
             "Communes demandées",
             "Communes limitrophes",
             "Autres communes du département"
         ]
 
-        selected = None
-        selected_info = None
         selected_card = None
+        selected_info = None
 
-        # First check 'Communes demandées' for matches
         matches = find_matching_offers_in_section(driver, wait, seen, "Communes demandées")
         if matches:
             selected_card, selected_info = matches[0]
             logging.info("Selected first matching offer in 'Communes demandées'")
         else:
-            # No matches in demandées => check remaining sections in order
             for sect in ("Communes limitrophes", "Autres communes du département"):
                 matches = find_matching_offers_in_section(driver, wait, seen, sect)
                 if matches:
@@ -420,7 +446,7 @@ def main():
         uid = info["uid"]
         logging.info(f"Applying to selected offer: {info}")
 
-        # Try to open detail (image or card)
+        # open detail
         try:
             try:
                 img_el = selected_card.find_element(By.CSS_SELECTOR, ".offer-image img")
@@ -434,15 +460,16 @@ def main():
             save_seen(seen)
             return
 
-        # Robust apply flow
         applied, result = robust_click_apply_flow(driver, wait)
         if applied:
             seen.add(uid)
             save_seen(seen)
             subject = f"BOTALIN - Applied to offer ({info['loc']})"
             body = f"Applied to: {info}\nResult: {result}"
-            send_email(subject, body)
-            logging.info("Applied and notified by email.")
+            ok_email = send_email(subject, body)
+            if not ok_email:
+                logging.warning("Email notification failed; check SMTP credentials or use App Password.")
+            logging.info("Applied (or attempted) and processed notification.")
         else:
             logging.error(f"Failed to click apply for offer: {info}")
             send_email("BOTALIN - Apply click failed", f"Failed to click apply button for offer: {info}")
