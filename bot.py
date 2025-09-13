@@ -1,127 +1,133 @@
+import os
 import time
 import logging
+import smtplib
+from email.mime.text import MIMEText
 from selenium import webdriver
 from selenium.webdriver.common.by import By
-from selenium.webdriver.common.keys import Keys
+from selenium.webdriver.chrome.options import Options
+from selenium.webdriver.common.action_chains import ActionChains
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
-from selenium.common.exceptions import TimeoutException
 
-# -------------------------------------------------------------------
-# CONFIGURATION
-# -------------------------------------------------------------------
-EMAIL = "tesstedsgstsredr@gmail.com"
-PASSWORD = "tesstedsgstsredr@gmail.com1212"
-LOGIN_URL = "https://al-in.fr/auth/login"
+# ----------------- CONFIG -----------------
+BASE_URL = "https://al-in.fr/#/connexion-demandeur"
+EMAIL = os.environ.get("EMAIL")
+PASSWORD = os.environ.get("PASSWORD")
+WAIT_TIMEOUT = 10
+HEADLESS = os.environ.get("HEADLESS", "true").lower() in ("1", "true", "yes")
 
+if not EMAIL or not PASSWORD:
+    logging.error("EMAIL and PASSWORD environment variables must be set.")
+    raise SystemExit(1)
+
+# Mail jetable (directement en dur)
+SMTP_SERVER = "smtp.gmail.com"
+SMTP_PORT = 587
+SENDER_EMAIL = "tesstedsgstsredr@gmail.com"
+SENDER_PASSWORD = "tesstedsgstsredr@gmail.com1212"
+RECEIVER_EMAIL = "fennane.mohamedamine@gmail.com"
+
+# Logging setup
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s - %(levelname)s - %(message)s"
 )
 
-# -------------------------------------------------------------------
-# INITIALISATION DU DRIVER
-# -------------------------------------------------------------------
+# ----------------- SELENIUM DRIVER -----------------
 def init_driver():
-    logging.info("Starting bot")
-    options = webdriver.ChromeOptions()
+    options = Options()
+    if HEADLESS:
+        options.add_argument("--headless=new")
     options.add_argument("--no-sandbox")
     options.add_argument("--disable-dev-shm-usage")
-    options.add_argument("--headless=new")  # mode headless
+    logging.info("Starting bot")
     driver = webdriver.Chrome(options=options)
-    driver.set_window_size(1280, 1024)
     return driver
 
-# -------------------------------------------------------------------
-# LOGIN
-# -------------------------------------------------------------------
+# ----------------- MAIL FUNCTION -----------------
+def send_email(subject, body):
+    try:
+        msg = MIMEText(body)
+        msg["From"] = SENDER_EMAIL
+        msg["To"] = RECEIVER_EMAIL
+        msg["Subject"] = subject
+
+        with smtplib.SMTP(SMTP_SERVER, SMTP_PORT) as server:
+            server.starttls()
+            server.login(SENDER_EMAIL, SENDER_PASSWORD)
+            server.sendmail(SENDER_EMAIL, RECEIVER_EMAIL, msg.as_string())
+
+        logging.info(f"Email sent to {RECEIVER_EMAIL}")
+    except Exception as e:
+        logging.error(f"Failed to send email: {e}")
+
+# ----------------- BOT ACTIONS -----------------
 def login(driver):
-    driver.get(LOGIN_URL)
+    driver.get(BASE_URL)
+    WebDriverWait(driver, WAIT_TIMEOUT).until(EC.presence_of_element_located((By.NAME, "username")))
+    driver.find_element(By.NAME, "username").send_keys(EMAIL)
+    driver.find_element(By.NAME, "password").send_keys(PASSWORD)
+    driver.find_element(By.CSS_SELECTOR, "button[type='submit']").click()
+    WebDriverWait(driver, WAIT_TIMEOUT).until(EC.presence_of_element_located((By.CLASS_NAME, "offers")))
+    logging.info("Login successful.")
+
+def apply_first_offer(driver):
+    offers = driver.find_elements(By.CLASS_NAME, "offer-card-container")
+    if not offers:
+        logging.info("No offers found.")
+        return None
+
+    offer = offers[0]
+    img_src = offer.find_element(By.TAG_NAME, "img").get_attribute("src")
+    price_text = offer.find_element(By.CLASS_NAME, "price").text.strip()
+    typ = offer.find_element(By.CLASS_NAME, "typology").text.strip()
+    loc = offer.find_element(By.CLASS_NAME, "location").text.strip()
+
+    offer_data = {
+        "img_src": img_src,
+        "price_text": price_text,
+        "typ": typ,
+        "loc": loc
+    }
+
+    logging.info(f"Applying to first offer: {offer_data}")
+
+    ActionChains(driver).move_to_element(offer).click().perform()
+    WebDriverWait(driver, 10).until(EC.element_to_be_clickable((By.XPATH, "//button[contains(text(),'Je postule')]"))).click()
+    logging.info("Clicked 'Je postule'")
+
+    WebDriverWait(driver, 10).until(EC.element_to_be_clickable((By.XPATH, "//button[contains(text(),'Confirmer')]"))).click()
+    logging.info("Clicked 'Confirmer'")
+
+    WebDriverWait(driver, 10).until(EC.element_to_be_clickable((By.XPATH, "//button[contains(text(),'Ok')]"))).click()
+    logging.info("Clicked 'Ok'")
+
+    time.sleep(2)
     try:
-        # attendre le champ email
-        email_field = WebDriverWait(driver, 20).until(
-            EC.presence_of_element_located((By.CSS_SELECTOR, "input[type='email']"))
-        )
-        pwd_field = driver.find_element(By.CSS_SELECTOR, "input[type='password']")
+        result_text = driver.find_element(By.CLASS_NAME, "swal2-html-container").text
+    except:
+        result_text = "Application sent (no confirmation text found)."
 
-        email_field.clear()
-        email_field.send_keys(EMAIL)
-        pwd_field.clear()
-        pwd_field.send_keys(PASSWORD)
+    logging.info(f"Application result: {result_text}")
+    return f"Offer: {offer_data}\n\nResult: {result_text}"
 
-        # bouton de connexion
-        login_btn = driver.find_element(By.CSS_SELECTOR, "button[type='submit']")
-        login_btn.click()
-
-        # attendre que les offres apparaissent après login
-        WebDriverWait(driver, 20).until(
-            EC.presence_of_element_located((By.CSS_SELECTOR, "div.offer-card-container"))
-        )
-        logging.info("Login successful.")
-        return True
-
-    except TimeoutException:
-        logging.error("Login failed.")
-        return False
-
-# -------------------------------------------------------------------
-# CHERCHE ET POSTULE SUR UNE OFFRE
-# -------------------------------------------------------------------
-def search_and_apply_offer(driver):
-    logging.info("Searching for offers...")
-
-    offers = driver.find_elements(By.CSS_SELECTOR, "div.offer-card-container")
-    for offer in offers:
-        try:
-            price_text = offer.find_element(By.CSS_SELECTOR, ".price").text
-            typ = offer.find_element(By.CSS_SELECTOR, ".typology").text
-            loc = offer.find_element(By.CSS_SELECTOR, ".location").text
-            img = offer.find_element(By.CSS_SELECTOR, ".offer-image img").get_attribute("src")
-
-            # 🎯 Filtre : Choisy-le-Roi
-            if "Choisy-le-Roi" in loc:
-                target_offer = {
-                    "uid": img,
-                    "img_src": img,
-                    "price_text": price_text,
-                    "typ": typ,
-                    "loc": loc
-                }
-                logging.info(f"Found target offer: {target_offer}")
-
-                # Trouver le bouton "Postuler"
-                apply_btn = offer.find_element(By.CSS_SELECTOR, "button.btn-secondary")
-
-                # ✅ Correction : scroller et forcer clic JS
-                driver.execute_script("arguments[0].scrollIntoView(true);", apply_btn)
-                time.sleep(1)
-                driver.execute_script("arguments[0].click();", apply_btn)
-
-                logging.info("Clicked on apply button successfully.")
-                return True
-        except Exception as e:
-            logging.warning(f"Error processing offer: {e}")
-            continue
-
-    logging.info("No matching offer found.")
-    return False
-
-# -------------------------------------------------------------------
-# MAIN
-# -------------------------------------------------------------------
+# ----------------- MAIN -----------------
 def main():
-    driver = init_driver()
+    driver = None
     try:
-        if login(driver):
-            applied = search_and_apply_offer(driver)
-            if applied:
-                logging.info("Application done.")
-            else:
-                logging.info("No application submitted.")
+        driver = init_driver()
+        login(driver)
+        result = apply_first_offer(driver)
+
+        if result:
+            send_email("Bot application finished ✅", result)
+            logging.info("Bot finished successfully (applied to 1st offer).")
         else:
-            logging.error("Could not log in.")
+            send_email("Bot application finished ⚠️", "No offers found.")
     finally:
-        driver.quit()
+        if driver:
+            driver.quit()
 
 if __name__ == "__main__":
     main()
