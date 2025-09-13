@@ -1,4 +1,4 @@
-# bot.py - watcher + apply + email notifications
+# bot.py - watcher + apply + email notifications (priority: Communes demandées, max price 600)
 import os
 import time
 import json
@@ -23,23 +23,23 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(
 
 # ---------- CONFIG ----------
 BASE_URL = "https://al-in.fr/#/connexion-demandeur"
-# Credentials for site - MUST be set (or hardcode here if you insist)
+# Site credentials (kept as before)
 EMAIL = os.environ.get("EMAIL") or "mohamed-amine.fennane@epita.fr"
 PASSWORD = os.environ.get("PASSWORD") or "&9.Mnq.6F8'M/wm{"
 
-# SMTP (you asked to hardcode the test account)
+# SMTP credentials (as requested)
 SENDER_EMAIL = "tesstedsgstsredr@gmail.com"
-SENDER_PASS = "tesstedsgstsredr@gmail.com1212"   # provided by you (jetable)
+SENDER_PASS = "tesstedsgstsredr@gmail.com1212"
 RECIPIENT_EMAIL = "fennane.mohamedamine@gmail.com"
 
 WAIT_TIMEOUT = 12
 HEADLESS = os.environ.get("HEADLESS", "true").lower() in ("1", "true", "yes")
 SEEN_FILE = "offers_seen.json"
-MAX_RUN_SECONDS = int(os.environ.get("MAX_RUN_SECONDS", 300))  # default 5 minutes
+MAX_RUN_SECONDS = int(os.environ.get("MAX_RUN_SECONDS", 300))
 POLL_INTERVAL = int(os.environ.get("POLL_INTERVAL", 15))
 
-# Matching criteria
-MAX_PRICE = 650
+# Matching criteria (updated)
+MAX_PRICE = 600
 WANTED_TYPOLOGY_KEY = "T2"
 
 # Retry / scroll settings
@@ -47,7 +47,6 @@ CLICK_RETRIES = 5
 SCROLL_PAUSE = 0.6
 CONTAINER_SCROLL_ATTEMPTS = 30
 
-# Safety checks
 if not EMAIL or not PASSWORD:
     logging.error("EMAIL and PASSWORD must be set (site credentials).")
     raise SystemExit(1)
@@ -93,7 +92,6 @@ def save_seen(seen_set):
 def parse_price(price_text):
     if not price_text:
         return None
-    # match first occurrence of number + €
     m = re.search(r"(\d{1,3}(?:[ \u00A0]\d{3})*|\d+)\s*€", price_text.replace("\u00A0", " "))
     if not m:
         return None
@@ -113,7 +111,6 @@ def find_section_button(driver, name):
 
 
 def get_offer_cards_in_current_section(driver):
-    # ensures the container is present and returns .offer-card-container elements
     try:
         container = WebDriverWait(driver, WAIT_TIMEOUT).until(
             EC.presence_of_element_located((By.CSS_SELECTOR, ".offer-list-container"))
@@ -124,7 +121,6 @@ def get_offer_cards_in_current_section(driver):
 
 
 def click_element(driver, el):
-    # robust click: scroll into view, normal click, fallback to JS click
     try:
         driver.execute_script("arguments[0].scrollIntoView({block: 'center'});", el)
     except Exception:
@@ -166,14 +162,10 @@ def extract_offer_info(card):
 
 # ---------- Scrolling utilities ----------
 def progressive_scroll_container_to_bottom(driver, container, max_attempts=CONTAINER_SCROLL_ATTEMPTS, pause=SCROLL_PAUSE):
-    """
-    Try multiple scroll approaches to fully load offers inside container.
-    """
     prev_counts = []
     attempt = 0
     while attempt < max_attempts:
         try:
-            # set to bottom
             driver.execute_script("arguments[0].scrollTop = arguments[0].scrollHeight;", container)
         except Exception:
             try:
@@ -181,7 +173,6 @@ def progressive_scroll_container_to_bottom(driver, container, max_attempts=CONTA
             except Exception:
                 pass
 
-        # small stepped scroll to help lazy loads
         try:
             js = """
             const c = arguments[0];
@@ -217,7 +208,7 @@ def init_driver():
     options.add_argument("--disable-dev-shm-usage")
     options.add_argument("--window-size=1920,1080")
 
-    # avoid "user data directory is already in use" by using unique temp profile
+    # unique profile to avoid "user data directory is already in use"
     options.add_argument(f"--user-data-dir=/tmp/chrome_user_data_{os.getpid()}")
 
     try:
@@ -228,7 +219,6 @@ def init_driver():
     except Exception as e:
         logging.warning(f"Selenium Manager failed: {e}. Falling back to webdriver-manager.")
 
-    # fallback to webdriver-manager
     driver_path = ChromeDriverManager().install()
     if os.path.isdir(driver_path):
         for root, _, files in os.walk(driver_path):
@@ -281,22 +271,13 @@ def ensure_logged_in(driver, wait):
     return perform_login(driver, wait)
 
 
-# ---------- Apply attempt (robust) ----------
+# ---------- Robust apply flow ----------
 def robust_click_apply_flow(driver, wait):
-    """
-    On the offer detail page try to click 'Je postule', 'Confirmer', 'Ok' robustly.
-    Returns tuple (applied_bool, reason_str)
-    """
-    # Wait short to allow any overlays to settle
-    time.sleep(0.5)
-
-    # Look for postule button with retries
     for attempt in range(CLICK_RETRIES):
         try:
             apply_btn = wait.until(EC.element_to_be_clickable((
                 By.XPATH, "//button[contains(.,'Je postule') or contains(.,'JE POSTULE') or contains(.,'Je postuler')]"
             )))
-            # try scrolling around before click if overlay covers it
             try:
                 driver.execute_script("arguments[0].scrollIntoView({block:'center'}); window.scrollBy(0, -80);", apply_btn)
             except Exception:
@@ -304,7 +285,6 @@ def robust_click_apply_flow(driver, wait):
             try:
                 apply_btn.click()
             except ElementClickInterceptedException:
-                # fallback: JS click
                 try:
                     driver.execute_script("arguments[0].click();", apply_btn)
                 except Exception as e:
@@ -314,7 +294,6 @@ def robust_click_apply_flow(driver, wait):
             break
         except Exception as e:
             logging.debug(f"Attempt {attempt+1} click 'Je postule' failed: {e}")
-            # try a little scroll in the container & window
             try:
                 driver.execute_script("window.scrollTo(0, document.body.scrollHeight);")
                 time.sleep(0.2)
@@ -325,7 +304,6 @@ def robust_click_apply_flow(driver, wait):
     else:
         return False, "apply_click_failed"
 
-    # Confirm if exists
     try:
         confirm_btn = wait.until(EC.element_to_be_clickable((By.XPATH, "//button[contains(.,'Confirmer')]")))
         try:
@@ -336,7 +314,6 @@ def robust_click_apply_flow(driver, wait):
     except TimeoutException:
         logging.info("No 'Confirmer' button found (maybe not required).")
 
-    # Close final modal with Ok if present
     try:
         ok_btn = wait.until(EC.element_to_be_clickable((By.XPATH, "//button[normalize-space(.)='Ok' or contains(.,'OK') or contains(.,'Ok')]")))
         try:
@@ -347,7 +324,6 @@ def robust_click_apply_flow(driver, wait):
     except TimeoutException:
         logging.debug("No final OK button found.")
 
-    # Check result text
     try:
         txt = wait.until(EC.presence_of_element_located((By.CSS_SELECTOR, ".text_picto_vert")), )
         val = txt.text.strip()
@@ -356,6 +332,39 @@ def robust_click_apply_flow(driver, wait):
     except TimeoutException:
         logging.debug("No application result text found.")
         return True, "applied_but_no_text"
+
+
+# ---------- Section scanning helper ----------
+def find_matching_offers_in_section(driver, wait, seen, section_name):
+    """Return list of (card, info) that match criteria and are not seen."""
+    found = []
+    btn = find_section_button(driver, section_name)
+    if not btn:
+        logging.debug(f"Section '{section_name}' not found.")
+        return found
+    click_element(driver, btn)
+    time.sleep(0.6)
+    try:
+        container = wait.until(EC.presence_of_element_located((By.CSS_SELECTOR, ".offer-list-container")))
+        progressive_scroll_container_to_bottom(driver, container)
+    except Exception:
+        pass
+    time.sleep(0.3)
+    cards = get_offer_cards_in_current_section(driver)
+    logging.info(f"Found {len(cards)} cards in '{section_name}' during matching check")
+    for card in cards:
+        info = extract_offer_info(card)
+        uid = info.get("uid")
+        if not uid or uid in seen:
+            continue
+        if info.get("price") is None:
+            continue
+        if WANTED_TYPOLOGY_KEY.upper() not in info.get("typ", "").upper():
+            continue
+        if info.get("price") > MAX_PRICE:
+            continue
+        found.append((card, info))
+    return found
 
 
 # ---------- Main ----------
@@ -378,110 +387,68 @@ def main():
             send_email("BOTALIN - Login failed", "The bot could not log in with provided credentials.")
             return
 
-        # Sections order per request
-        section_names = [
+        # Priority: Communes demandées first
+        sections_priority = [
             "Communes demandées",
             "Communes limitrophes",
             "Autres communes du département"
         ]
 
-        # Aggressively gather baseline (scroll each section to bottom to load offers)
-        for sect in section_names:
-            logging.info(f"Baseline load for section '{sect}'")
-            btn = find_section_button(driver, sect)
-            if not btn:
-                logging.warning(f"Section button '{sect}' not found")
-                continue
-            click_element(driver, btn)
-            time.sleep(0.6)
-            # attempt to scroll container
-            try:
-                container = wait.until(EC.presence_of_element_located((By.CSS_SELECTOR, ".offer-list-container")))
-                progressive_scroll_container_to_bottom(driver, container)
-            except Exception:
-                pass
-            # small wait for stability
-            time.sleep(0.3)
+        selected = None
+        selected_info = None
+        selected_card = None
 
-        # Now search for new offers that match
-        applied_any = False
-        for sect in section_names:
-            logging.info(f"Selecting section '{sect}'")
-            btn = find_section_button(driver, sect)
-            if not btn:
-                logging.warning(f"Section '{sect}' not found; skipping")
-                continue
-            click_element(driver, btn)
-            time.sleep(0.8)
-
-            # ensure container scrolled so we have all cards
-            try:
-                container = wait.until(EC.presence_of_element_located((By.CSS_SELECTOR, ".offer-list-container")))
-                progressive_scroll_container_to_bottom(driver, container)
-            except Exception:
-                pass
-
-            cards = get_offer_cards_in_current_section(driver)
-            logging.info(f"Found {len(cards)} cards in '{sect}'")
-
-            # iterate through cards and find first new matching T2 <= MAX_PRICE
-            for card in cards:
-                info = extract_offer_info(card)
-                uid = info["uid"]
-                if not uid:
-                    continue
-                if uid in seen:
-                    continue
-                # price parse
-                if info["price"] is None:
-                    continue
-                if WANTED_TYPOLOGY_KEY.upper() not in info["typ"].upper():
-                    continue
-                if info["price"] > MAX_PRICE:
-                    continue
-
-                # found candidate => try to apply to it
-                logging.info(f"Applying to new offer: {info}")
-                # open detail: click image or card
-                try:
-                    try:
-                        img_el = card.find_element(By.CSS_SELECTOR, ".offer-image img")
-                        click_element(driver, img_el)
-                    except Exception:
-                        # fallback: click the card itself
-                        click_element(driver, card)
-                except Exception as e:
-                    logging.warning(f"Could not open offer detail: {e}")
-                    send_email("BOTALIN - Open offer failed", f"Failed to open offer detail: {info}\nException: {e}")
-                    seen.add(uid)
-                    save_seen(seen)
-                    continue
-
-                # robust apply flow (with retries and scrolls)
-                applied, result = robust_click_apply_flow(driver, wait)
-                if applied:
-                    # success path: save seen, notify
-                    seen.add(uid)
-                    save_seen(seen)
-                    subject = f"BOTALIN - Applied to offer ({info['loc']})"
-                    body = f"Applied to: {info}\nResult: {result}"
-                    send_email(subject, body)
-                    logging.info("Applied and notified by email.")
-                    applied_any = True
+        # First check 'Communes demandées' for matches
+        matches = find_matching_offers_in_section(driver, wait, seen, "Communes demandées")
+        if matches:
+            selected_card, selected_info = matches[0]
+            logging.info("Selected first matching offer in 'Communes demandées'")
+        else:
+            # No matches in demandées => check remaining sections in order
+            for sect in ("Communes limitrophes", "Autres communes du département"):
+                matches = find_matching_offers_in_section(driver, wait, seen, sect)
+                if matches:
+                    selected_card, selected_info = matches[0]
+                    logging.info(f"Selected first matching offer in '{sect}'")
                     break
-                else:
-                    # failure on clicking apply
-                    logging.error(f"Failed to click apply for offer: {info}")
-                    send_email("BOTALIN - Apply click failed", f"Failed to click apply button for offer: {info}")
-                    # mark as seen to avoid retrying same failing offer repeatedly
-                    seen.add(uid)
-                    save_seen(seen)
-                    # continue to next offer
-            if applied_any:
-                break
 
-        if not applied_any:
+        if not selected_card:
             logging.info("No matching new offers found during this run.")
+            return
+
+        info = selected_info
+        uid = info["uid"]
+        logging.info(f"Applying to selected offer: {info}")
+
+        # Try to open detail (image or card)
+        try:
+            try:
+                img_el = selected_card.find_element(By.CSS_SELECTOR, ".offer-image img")
+                click_element(driver, img_el)
+            except Exception:
+                click_element(driver, selected_card)
+        except Exception as e:
+            logging.warning(f"Could not open offer detail: {e}")
+            send_email("BOTALIN - Open offer failed", f"Failed to open offer detail: {info}\nException: {e}")
+            seen.add(uid)
+            save_seen(seen)
+            return
+
+        # Robust apply flow
+        applied, result = robust_click_apply_flow(driver, wait)
+        if applied:
+            seen.add(uid)
+            save_seen(seen)
+            subject = f"BOTALIN - Applied to offer ({info['loc']})"
+            body = f"Applied to: {info}\nResult: {result}"
+            send_email(subject, body)
+            logging.info("Applied and notified by email.")
+        else:
+            logging.error(f"Failed to click apply for offer: {info}")
+            send_email("BOTALIN - Apply click failed", f"Failed to click apply button for offer: {info}")
+            seen.add(uid)
+            save_seen(seen)
+
     except Exception as e:
         logging.error(f"Unhandled exception in main: {e}")
         send_email("BOTALIN - Unhandled error", f"Unhandled exception: {e}")
