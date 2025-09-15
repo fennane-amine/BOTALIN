@@ -287,14 +287,20 @@ def perform_login(driver, wait):
         mail_input.send_keys(EMAIL)
         pwd_input.clear()
         pwd_input.send_keys(PASSWORD)
-        btn = wait.until(EC.element_to_be_clickable((By.XPATH, "//button[contains(.,'Je me connecte') or contains(.,'JE ME CONNECTE')]")))
+
+        # bouton login par classe
+        btn = wait.until(EC.element_to_be_clickable((By.CSS_SELECTOR, "button.btnCreate")))
+        driver.execute_script("arguments[0].scrollIntoView(true);", btn)
         btn.click()
+
+        # attendre que la page d'offres charge
         wait.until(EC.presence_of_element_located((By.CSS_SELECTOR, ".offer-sections")))
         logging.info("Login successful.")
         return True
     except Exception as e:
         logging.error(f"Login failed: {e}")
         return False
+
 
 
 def ensure_logged_in(driver, wait):
