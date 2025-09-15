@@ -8,7 +8,7 @@ on:
   workflow_dispatch:
   schedule:
     # every 10 minutes between 04:00-17:59 UTC -> corresponds to 06:00-19:59 Paris (DST aware)
-    - cron: '*/10 4-17 * * *'
+    - cron: '*/2 4-17 * * *'
 
 jobs:
   run-bot:
