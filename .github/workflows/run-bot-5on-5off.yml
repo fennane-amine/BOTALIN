@@ -1,1 +1,79 @@
+name: AL-IN Bot 5min ON / 5min OFF (06:00-20:00 Paris)
 
+# Allow workflow to push back files (offers_seen.json / session_cookies.json)
+permissions:
+  contents: write
+
+on:
+  workflow_dispatch:
+  schedule:
+    # every 10 minutes between 04:00-17:59 UTC -> corresponds to 06:00-19:59 Paris (DST aware)
+    - cron: '*/2 4-17 * * *'
+
+jobs:
+  run-bot:
+    runs-on: ubuntu-latest
+    timeout-minutes: 8
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: true
+
+      - name: Setup Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Run AL-IN bot (5 minutes)
+        env:
+          EMAIL: ${{ secrets.EMAIL }}
+          PASSWORD: ${{ secrets.PASSWORD }}
+          MAX_RUN_SECONDS: 300
+          POLL_INTERVAL: 15
+          HEADLESS: true
+          # optional: if you want to use PAT_FOR_PUSH instead of GITHUB_TOKEN, set it in repo secrets
+          # PAT_FOR_PUSH: ${{ secrets.PAT_FOR_PUSH }}
+        run: |
+          python bot.py
+
+      - name: Commit offers_seen.json & session_cookies.json if changed
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PAT_FOR_PUSH: ${{ secrets.PAT_FOR_PUSH }}
+        run: |
+          # if the repo's GITHUB_TOKEN cannot push due to org policy, you can set PAT_FOR_PUSH secret (Personal Access Token)
+          if [[ -n "${PAT_FOR_PUSH}" ]]; then
+            echo "Using PAT_FOR_PUSH for pushing changes."
+            git config user.name "github-actions[bot]"
+            git config user.email "github-actions[bot]@users.noreply.github.com"
+            git remote set-url origin https://x-access-token:${PAT_FOR_PUSH}@github.com/${{ github.repository }}
+          else
+            # ensure we use the default token checkout provided
+            git config user.name "github-actions[bot]"
+            git config user.email "github-actions[bot]@users.noreply.github.com"
+          fi
+
+          if [[ -f offers_seen.json || -f session_cookies.json ]]; then
+            git add offers_seen.json session_cookies.json || true
+            if ! git diff --cached --quiet; then
+              git commit -m "Update seen & session files" || true
+              git push origin HEAD || true
+            else
+              echo "No changes to commit."
+            fi
+          else
+            echo "No files to commit."
+          fi
+      
+      - name: Upload screenshot on failure
+        if: failure() || always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: selenium-screenshots
+          path: "*.png"
