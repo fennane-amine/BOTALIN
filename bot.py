@@ -25,7 +25,12 @@ from selenium import webdriver
 from selenium.webdriver.common.by import By
 from selenium.webdriver.chrome.options import Options
 from selenium.webdriver.chrome.service import Service
-from selenium.common.exceptions import TimeoutException, ElementClickInterceptedException, WebDriverException, NoSuchElementException
+from selenium.common.exceptions import (
+    TimeoutException,
+    ElementClickInterceptedException,
+    WebDriverException,
+    NoSuchElementException,
+)
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
 
@@ -39,9 +44,9 @@ BASE_URL = "https://al-in.fr/#/connexion-demandeur"
 EMAIL = os.environ.get("EMAIL") or "mohamed-amine.fennane@epita.fr"
 PASSWORD = os.environ.get("PASSWORD") or "&9.Mnq.6F8'M/wm{"
 
-# SMTP / notification
+# SMTP / notification (defaults provided so tu peux tester)
 SENDER_EMAIL = os.environ.get("SENDER_EMAIL") or "tesstedsgstsredr@gmail.com"
-SENDER_PASS = "usdd czjy zsnq iael" or "tesstedsgstsredr@gmail.com1212"  # prefer env var for security
+SENDER_PASS = os.environ.get("SENDER_PASS") or "tesstedsgstsredr@gmail.com1212"
 RECIPIENT_EMAIL = os.environ.get("RECIPIENT_EMAIL") or "fennane.mohamedamine@gmail.com"
 
 WAIT_TIMEOUT = 12
@@ -51,13 +56,13 @@ MAX_RUN_SECONDS = int(os.environ.get("MAX_RUN_SECONDS", 300))
 POLL_INTERVAL = int(os.environ.get("POLL_INTERVAL", 15))
 
 # Matching criteria
-MAX_PRICE = 600
-WANTED_TYPOLOGY_KEY = "T2"
+MAX_PRICE = int(os.environ.get("MAX_PRICE", 600))
+WANTED_TYPOLOGY_KEY = os.environ.get("WANTED_TYPOLOGY_KEY", "T2")
 
 # Scrolling / retries
-CLICK_RETRIES = 5
-SCROLL_PAUSE = 0.6
-CONTAINER_SCROLL_ATTEMPTS = 30
+CLICK_RETRIES = int(os.environ.get("CLICK_RETRIES", 5))
+SCROLL_PAUSE = float(os.environ.get("SCROLL_PAUSE", 0.6))
+CONTAINER_SCROLL_ATTEMPTS = int(os.environ.get("CONTAINER_SCROLL_ATTEMPTS", 30))
 
 # Basic sanity
 if not EMAIL or not PASSWORD:
@@ -88,7 +93,6 @@ def send_email(subject: str, body: str):
     except Exception as e:
         logging.warning(f"SMTP TLS send failed: {e}")
 
-    # fallback to SSL port 465
     try:
         with smtplib.SMTP_SSL("smtp.gmail.com", 465, timeout=20) as s:
             s.login(SENDER_EMAIL, SENDER_PASS)
@@ -112,21 +116,6 @@ def load_seen():
     except Exception:
         return set()
 
-def handle_cookie_banner(driver, timeout=5):
-    """
-    Essaie de fermer la pop-in cookies si elle est présente
-    """
-    try:
-        # Attendre que la bannière apparaisse
-        cookie_button = WebDriverWait(driver, timeout).until(
-            EC.element_to_be_clickable((By.XPATH, "//button[contains(., 'Accepter tous les cookies') or contains(., 'Tout accepter')]"))
-        )
-        cookie_button.click()
-        print("✅ Bannière cookies acceptée automatiquement.")
-    except TimeoutException:
-        print("ℹ️ Pas de bannière cookies détectée.")
-    except NoSuchElementException:
-        print("ℹ️ Aucun bouton de cookies trouvé.")
 
 def save_seen(seen_set):
     try:
@@ -150,6 +139,40 @@ def parse_price(price_text):
         return None
 
 
+def handle_cookie_banner(driver, timeout=5):
+    """
+    Essaie de fermer la pop-in cookies si elle est présente.
+    Plusieurs sélecteurs sont testés pour couvrir différentes versions du site.
+    """
+    selectors = [
+        "//button[contains(., 'Accepter tous les cookies') or contains(., 'Tout accepter') or contains(., 'Accepter')]",  # fr
+        "//button[contains(., 'Autoriser les cookies')]",
+        "//button[contains(., 'Accept all cookies') or contains(., 'Accept all')]",
+        "//a[contains(., 'Accepter tous les cookies') or contains(., 'Accepter')]",
+        "//button[contains(@class,'cookie') and (contains(.,'Accepter') or contains(.,'Tout'))]"
+    ]
+    for sel in selectors:
+        try:
+            el = WebDriverWait(driver, timeout).until(EC.element_to_be_clickable((By.XPATH, sel)))
+            try:
+                el.click()
+                logging.info("✅ Bannière cookies acceptée automatiquement.")
+                return True
+            except Exception:
+                try:
+                    driver.execute_script("arguments[0].click();", el)
+                    logging.info("✅ Bannière cookies acceptée automatiquement (JS click).")
+                    return True
+                except Exception:
+                    pass
+        except TimeoutException:
+            continue
+        except NoSuchElementException:
+            continue
+    logging.debug("ℹ️ Pas de bannière cookies détectée ou pas cliquable.")
+    return False
+
+
 def find_section_button(driver, name):
     xpath = f"//div[contains(@class,'offer-sections')]//div[contains(normalize-space(.),'{name}')]"
     try:
@@ -165,7 +188,23 @@ def get_offer_cards_in_current_section(driver):
         )
     except TimeoutException:
         return []
-    return container.find_elements(By.CSS_SELECTOR, ".offer-card-container")
+    # app-offer-card or .offer-card-container
+    try:
+        cards = container.find_elements(By.CSS_SELECTOR, "app-offer-card, .offer-card-container")
+        normalized = []
+        for c in cards:
+            try:
+                classes = (c.get_attribute("class") or "")
+                if "offer-card-container" in classes:
+                    normalized.append(c)
+                else:
+                    inner = c.find_element(By.CSS_SELECTOR, ".offer-card-container")
+                    normalized.append(inner)
+            except Exception:
+                normalized.append(c)
+        return normalized
+    except Exception:
+        return []
 
 
 def click_element(driver, el):
@@ -221,6 +260,7 @@ def progressive_scroll_container_to_bottom(driver, container, max_attempts=CONTA
             except Exception:
                 pass
 
+        # small progressive steps to trigger lazy-load
         try:
             js = """
             const c = arguments[0];
@@ -311,6 +351,7 @@ def perform_login(driver, wait):
         driver.execute_script("arguments[0].scrollIntoView(true);", btn)
         btn.click()
 
+        # handle cookie banner if present
         handle_cookie_banner(driver)
 
         # Attendre que la page offres charge
@@ -319,9 +360,14 @@ def perform_login(driver, wait):
         return True
 
     except Exception as e:
-        driver.save_screenshot("login_error.png")  # 👈 pour debug
+        try:
+            driver.save_screenshot("login_error.png")  # 👈 pour debug
+            logging.info("Saved screenshot login_error.png for debugging.")
+        except Exception:
+            pass
         logging.error(f"Login failed: {e}")
         return False
+
 
 def ensure_logged_in(driver, wait):
     if is_logged_in(driver):
@@ -334,7 +380,8 @@ def robust_click_apply_flow(driver, wait):
     for attempt in range(CLICK_RETRIES):
         try:
             apply_btn = wait.until(EC.element_to_be_clickable((
-                By.XPATH, "//button[contains(.,'Je postule') or contains(.,'JE POSTULE') or contains(.,'Je postuler')]"
+                By.XPATH,
+                "//button[contains(.,'Je postule') or contains(.,'JE POSTULE') or contains(.,'Je postuler')]"
             )))
             try:
                 driver.execute_script("arguments[0].scrollIntoView({block:'center'}); window.scrollBy(0, -80);", apply_btn)
@@ -383,11 +430,11 @@ def robust_click_apply_flow(driver, wait):
         logging.debug("No final OK button found.")
 
     try:
-        txt = wait.until(EC.presence_of_element_located((By.CSS_SELECTOR, ".text_picto_vert")), )
+        txt = wait.until(EC.presence_of_element_located((By.CSS_SELECTOR, ".text_picto_vert")), timeout=WAIT_TIMEOUT)
         val = txt.text.strip()
         logging.info("Application result text found.")
         return True, val
-    except TimeoutException:
+    except Exception:
         logging.debug("No application result text found.")
         return True, "applied_but_no_text"
 
@@ -452,6 +499,7 @@ def main():
         selected_card = None
         selected_info = None
 
+        # priorité : Communes demandées, sinon limitrophes, sinon autres
         matches = find_matching_offers_in_section(driver, wait, seen, "Communes demandées")
         if matches:
             selected_card, selected_info = matches[0]
