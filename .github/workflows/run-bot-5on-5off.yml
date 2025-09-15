@@ -70,3 +70,10 @@ jobs:
           else
             echo "No files to commit."
           fi
+      
+      - name: Upload screenshot on failure
+        if: failure() || always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: selenium-screenshots
+          path: "*.png"
