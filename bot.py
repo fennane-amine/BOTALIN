@@ -44,12 +44,13 @@ BASE_URL = "https://al-in.fr/#/connexion-demandeur"
 EMAIL = os.environ.get("EMAIL") or "mohamed-amine.fennane@epita.fr"
 PASSWORD = os.environ.get("PASSWORD") or "&9.Mnq.6F8'M/wm{"
 
-# SMTP / notification (defaults provided so tu peux tester)
+# SMTP / notification (use env vars when possible)
 SENDER_EMAIL = os.environ.get("SENDER_EMAIL") or "tesstedsgstsredr@gmail.com"
-SENDER_PASS = os.environ.get("SENDER_PASS") or "tesstedsgstsredr@gmail.com1212"
+# prefer env var for security; fallback to the value you asked earlier
+SENDER_PASS = os.environ.get("SENDER_PASS") or "usdd czjy zsnq iael"
 RECIPIENT_EMAIL = os.environ.get("RECIPIENT_EMAIL") or "fennane.mohamedamine@gmail.com"
 
-WAIT_TIMEOUT = 12
+WAIT_TIMEOUT = int(os.environ.get("WAIT_TIMEOUT", 12))
 HEADLESS = os.environ.get("HEADLESS", "true").lower() in ("1", "true", "yes")
 SEEN_FILE = "offers_seen.json"
 MAX_RUN_SECONDS = int(os.environ.get("MAX_RUN_SECONDS", 300))
@@ -93,6 +94,7 @@ def send_email(subject: str, body: str):
     except Exception as e:
         logging.warning(f"SMTP TLS send failed: {e}")
 
+    # fallback to SSL port 465
     try:
         with smtplib.SMTP_SSL("smtp.gmail.com", 465, timeout=20) as s:
             s.login(SENDER_EMAIL, SENDER_PASS)
@@ -142,35 +144,61 @@ def parse_price(price_text):
 def handle_cookie_banner(driver, timeout=5):
     """
     Essaie de fermer la pop-in cookies si elle est présente.
-    Plusieurs sélecteurs sont testés pour couvrir différentes versions du site.
+    On tente plusieurs sélecteurs connus.
     """
     selectors = [
-        "//button[contains(., 'Accepter tous les cookies') or contains(., 'Tout accepter') or contains(., 'Accepter')]",  # fr
-        "//button[contains(., 'Autoriser les cookies')]",
-        "//button[contains(., 'Accept all cookies') or contains(., 'Accept all')]",
-        "//a[contains(., 'Accepter tous les cookies') or contains(., 'Accepter')]",
-        "//button[contains(@class,'cookie') and (contains(.,'Accepter') or contains(.,'Tout'))]"
+        "//button[contains(., 'Accepter tous les cookies')]",
+        "//button[contains(., 'Tout accepter')]",
+        "//button[contains(., 'Accepter')]",
+        "//button[contains(., 'Autoriser')]",
+        "//button[contains(., 'Accept all')]",
+        "//button[contains(@class,'cookie')]",
+        "//a[contains(.,'Accepter')]",
+        "button.tarteaucitronAllAll"  # fallback
     ]
-    for sel in selectors:
+    for s in selectors:
         try:
-            el = WebDriverWait(driver, timeout).until(EC.element_to_be_clickable((By.XPATH, sel)))
+            if s.startswith("//"):
+                el = WebDriverWait(driver, timeout).until(EC.element_to_be_clickable((By.XPATH, s)))
+            else:
+                el = WebDriverWait(driver, timeout).until(EC.element_to_be_clickable((By.CSS_SELECTOR, s)))
             try:
                 el.click()
-                logging.info("✅ Bannière cookies acceptée automatiquement.")
-                return True
             except Exception:
-                try:
-                    driver.execute_script("arguments[0].click();", el)
-                    logging.info("✅ Bannière cookies acceptée automatiquement (JS click).")
-                    return True
-                except Exception:
-                    pass
+                driver.execute_script("arguments[0].click();", el)
+            logging.info("✅ Bannière cookies acceptée automatiquement.")
+            return True
         except TimeoutException:
             continue
-        except NoSuchElementException:
+        except Exception:
             continue
-    logging.debug("ℹ️ Pas de bannière cookies détectée ou pas cliquable.")
+    logging.debug("ℹ️ Pas de bannière cookies détectée ou impossibilité de la fermer automatiquement.")
     return False
+
+
+def close_overlays(driver):
+    """
+    Tente de fermer les modales / overlays qui peuvent empêcher les clicks.
+    """
+    candidates = [
+        "//button[contains(@class,'close') or contains(.,'Fermer') or contains(.,'Close')]",
+        "//button[contains(@aria-label,'Close')]",
+        "//div[contains(@class,'overlay')]//button",
+        "//button[contains(.,'Refuser') or contains(.,'Refuser tous les cookies')]",
+        "//span[contains(@class,'cookie')]//a[contains(.,'Refuser')]",
+    ]
+    for sel in candidates:
+        try:
+            els = driver.find_elements(By.XPATH, sel)
+            for el in els:
+                try:
+                    if el.is_displayed():
+                        driver.execute_script("arguments[0].click();", el)
+                        time.sleep(0.2)
+                except Exception:
+                    continue
+        except Exception:
+            continue
 
 
 def find_section_button(driver, name):
@@ -188,40 +216,21 @@ def get_offer_cards_in_current_section(driver):
         )
     except TimeoutException:
         return []
-    # app-offer-card or .offer-card-container
-    try:
-        cards = container.find_elements(By.CSS_SELECTOR, "app-offer-card, .offer-card-container")
-        normalized = []
-        for c in cards:
-            try:
-                classes = (c.get_attribute("class") or "")
-                if "offer-card-container" in classes:
-                    normalized.append(c)
-                else:
-                    inner = c.find_element(By.CSS_SELECTOR, ".offer-card-container")
-                    normalized.append(inner)
-            except Exception:
-                normalized.append(c)
-        return normalized
-    except Exception:
-        return []
-
-
-def click_element(driver, el):
-    try:
-        driver.execute_script("arguments[0].scrollIntoView({block: 'center'});", el)
-    except Exception:
-        pass
-    try:
-        el.click()
-        return True
-    except Exception:
+    # support both app-offer-card and direct containers
+    cards = container.find_elements(By.CSS_SELECTOR, "app-offer-card, .offer-card-container")
+    normalized = []
+    for c in cards:
         try:
-            driver.execute_script("arguments[0].click();", el)
-            return True
-        except Exception as e:
-            logging.debug(f"JS click failed: {e}")
-            return False
+            classes = (c.get_attribute("class") or "")
+            if "offer-card-container" in classes:
+                normalized.append(c)
+            else:
+                inner = c.find_element(By.CSS_SELECTOR, ".offer-card-container")
+                normalized.append(inner)
+        except Exception:
+            # fallback: use c itself
+            normalized.append(c)
+    return normalized
 
 
 def extract_offer_info(card):
@@ -260,7 +269,6 @@ def progressive_scroll_container_to_bottom(driver, container, max_attempts=CONTA
             except Exception:
                 pass
 
-        # small progressive steps to trigger lazy-load
         try:
             js = """
             const c = arguments[0];
@@ -298,6 +306,7 @@ def init_driver():
     # unique profile to avoid "user data directory is already in use"
     options.add_argument(f"--user-data-dir=/tmp/chrome_user_data_{os.getpid()}")
 
+    # try Selenium Manager first
     try:
         logging.info("Trying Selenium Manager (webdriver.Chrome(options=...))")
         driver = webdriver.Chrome(options=options)
@@ -306,21 +315,32 @@ def init_driver():
     except Exception as e:
         logging.warning(f"Selenium Manager failed: {e}. Falling back to webdriver-manager.")
 
-    driver_path = ChromeDriverManager().install()
-    if os.path.isdir(driver_path):
-        for root, _, files in os.walk(driver_path):
-            for f in files:
-                if f.lower().startswith("chromedriver"):
-                    driver_path = os.path.join(root, f)
-                    break
+    # fallback to webdriver-manager binary
     try:
-        st = os.stat(driver_path)
-        os.chmod(driver_path, st.st_mode | stat.S_IEXEC)
-    except Exception:
-        pass
-    service = Service(driver_path)
-    driver = webdriver.Chrome(service=service, options=options)
-    return driver
+        driver_path = ChromeDriverManager().install()
+        if os.path.isdir(driver_path):
+            found = None
+            for root, dirs, files in os.walk(driver_path):
+                for f in files:
+                    if f.lower().startswith("chromedriver"):
+                        found = os.path.join(root, f)
+                        break
+                if found:
+                    break
+            if found:
+                driver_path = found
+        try:
+            st = os.stat(driver_path)
+            os.chmod(driver_path, st.st_mode | stat.S_IEXEC)
+        except Exception:
+            pass
+        service = Service(driver_path)
+        driver = webdriver.Chrome(service=service, options=options)
+        logging.info("Chrome initialized with webdriver-manager chromedriver.")
+        return driver
+    except Exception as e:
+        logging.error(f"Failed to initialize Chrome driver: {e}")
+        raise
 
 
 # ---------- Login ----------
@@ -329,39 +349,104 @@ def is_logged_in(driver):
         driver.find_element(By.CSS_SELECTOR, ".offer-sections")
         return True
     except Exception:
-        return False
+        # sometimes the logged-in landing page is 'Mes candidatures' or another dashboard
+        # check for presence of Mon compte / Mes candidatures etc.
+        try:
+            driver.find_element(By.XPATH, "//*[contains(text(),'Mes candidatures') or contains(text(),'Mon compte') or contains(text(),'Bienvenue')]")
+            return True
+        except Exception:
+            return False
 
 
 def perform_login(driver, wait):
     driver.get(BASE_URL)
+    # try to accept cookie banner immediately if present
     try:
+        handle_cookie_banner(driver, timeout=3)
+    except Exception:
+        pass
+
+    try:
+        # wait login form - use a flexible selector (site uses formcontrolname attributes)
         wait.until(EC.presence_of_element_located((By.CSS_SELECTOR, "form.global-form")))
-
-        # Email et mot de passe
-        mail_input = wait.until(EC.presence_of_element_located((By.CSS_SELECTOR, "input[formcontrolname='mail']")))
-        pwd_input = wait.until(EC.presence_of_element_located((By.CSS_SELECTOR, "input[formcontrolname='password']")))
-
+        mail_input = wait.until(EC.presence_of_element_located((By.CSS_SELECTOR, 'input[formcontrolname="mail"], input[type="email"], input[name="email"]')))
+        pwd_input = wait.until(EC.presence_of_element_located((By.CSS_SELECTOR, 'input[formcontrolname="password"], input[type="password"], input[name="password"]')))
         mail_input.clear()
         mail_input.send_keys(EMAIL)
         pwd_input.clear()
         pwd_input.send_keys(PASSWORD)
 
-        # Bouton login robuste (par classe btnCreate)
-        btn = wait.until(EC.element_to_be_clickable((By.CSS_SELECTOR, "button.btnCreate")))
-        driver.execute_script("arguments[0].scrollIntoView(true);", btn)
-        btn.click()
+        # Try a robust set of selectors for the login button
+        btn_selectors = [
+            (By.CSS_SELECTOR, "button.btnCreate"),
+            (By.XPATH, "//button[contains(.,'Je me connecte') or contains(.,'JE ME CONNECTE') or contains(.,'Se connecter')]"),
+            (By.XPATH, "//button[contains(.,'JE ME CONNECTE') or contains(.,'Je me connecte')]"),
+        ]
+        clicked = False
+        for sel in btn_selectors:
+            try:
+                btn = wait.until(EC.element_to_be_clickable(sel))
+                driver.execute_script("arguments[0].scrollIntoView(true);", btn)
+                try:
+                    btn.click()
+                except Exception:
+                    driver.execute_script("arguments[0].click();", btn)
+                clicked = True
+                break
+            except TimeoutException:
+                continue
+            except Exception:
+                continue
+        if not clicked:
+            logging.error("Login button not found during perform_login.")
+            driver.save_screenshot("login_error.png")
+            return False
 
-        # handle cookie banner if present
-        handle_cookie_banner(driver)
-
-        # Attendre que la page offres charge
-        wait.until(EC.presence_of_element_located((By.CSS_SELECTOR, ".offer-sections")))
-        logging.info("Login successful.")
-        return True
-
-    except Exception as e:
+        # After clicking, accept cookies again if overlay reappears
         try:
-            driver.save_screenshot("login_error.png")  # 👈 pour debug
+            handle_cookie_banner(driver, timeout=2)
+        except Exception:
+            pass
+
+        # After login, the app is SPA — wait for an element indicating offers loaded or header
+        # we relax the condition: presence of .offer-sections or links 'Les offres' or 'Mes candidatures'
+        wait.until(
+            EC.any_of(
+                EC.presence_of_element_located((By.CSS_SELECTOR, ".offer-sections")),
+                EC.presence_of_element_located((By.XPATH, "//a[contains(.,'Les offres')]")),
+                EC.presence_of_element_located((By.XPATH, "//*[contains(text(),'Mes candidatures')]")),
+            )
+        )
+        logging.info("Login successful (post-submit checks).")
+
+        # ensure we are on the offers page: click "Les offres" if present
+        try:
+            offres_btn = WebDriverWait(driver, 3).until(EC.element_to_be_clickable((By.XPATH, "//a[contains(.,'Les offres')]")))
+            try:
+                driver.execute_script("arguments[0].scrollIntoView(true);", offres_btn)
+                offres_btn.click()
+                logging.info("Clicked 'Les offres' to navigate to offers page.")
+            except Exception:
+                try:
+                    driver.execute_script("arguments[0].click();", offres_btn)
+                    logging.info("Clicked 'Les offres' (JS click).")
+                except Exception:
+                    logging.debug("Could not click 'Les offres' (maybe already on offers page).")
+        except Exception:
+            logging.debug("'Les offres' button not found or not clickable; continuing.")
+
+        # final handle cookies/overlays
+        try:
+            handle_cookie_banner(driver, timeout=1)
+            close_overlays(driver)
+        except Exception:
+            pass
+
+        return True
+    except Exception as e:
+        # save screenshot to debug failed login states
+        try:
+            driver.save_screenshot("login_error.png")
             logging.info("Saved screenshot login_error.png for debugging.")
         except Exception:
             pass
@@ -372,71 +457,142 @@ def perform_login(driver, wait):
 def ensure_logged_in(driver, wait):
     if is_logged_in(driver):
         return True
-    return perform_login(driver, wait)
+    logging.info("Not logged in. Performing full login with credentials.")
+    ok = perform_login(driver, wait)
+    if not ok:
+        logging.error("Full login failed.")
+    return ok
 
 
 # ---------- Robust apply flow ----------
 def robust_click_apply_flow(driver, wait):
-    for attempt in range(CLICK_RETRIES):
+    """
+    Attempts to click Apply button robustly, confirm, and fetch result text.
+    Returns (applied_bool, result_text_or_reason)
+    """
+    # ensure banners/overlays closed before clicking
+    close_overlays(driver)
+    handle_cookie_banner(driver)
+
+    for attempt in range(1, CLICK_RETRIES + 1):
         try:
-            apply_btn = wait.until(EC.element_to_be_clickable((
-                By.XPATH,
-                "//button[contains(.,'Je postule') or contains(.,'JE POSTULE') or contains(.,'Je postuler')]"
-            )))
+            # try the main apply button selectors
+            apply_selectors = [
+                (By.XPATH, "//button[contains(.,'Je postule') or contains(.,'JE POSTULE') or contains(.,'Je postuler')]"),
+                (By.CSS_SELECTOR, ".btn.btn-secondary.hi-check-round"),
+                (By.XPATH, "//button[contains(.,'Postuler') or contains(.,'Postulez')]"),
+            ]
+            apply_btn = None
+            for sel in apply_selectors:
+                try:
+                    apply_btn = wait.until(EC.element_to_be_clickable(sel))
+                    if apply_btn:
+                        break
+                except Exception:
+                    continue
+            if not apply_btn:
+                logging.debug(f"Attempt {attempt}: Apply button not found yet; scrolling and retrying.")
+                driver.execute_script("window.scrollTo(0, document.body.scrollHeight);")
+                time.sleep(0.4)
+                driver.execute_script("window.scrollTo(0, 0);")
+                time.sleep(0.6)
+                continue
+
+            # try to bring it into view & click
             try:
-                driver.execute_script("arguments[0].scrollIntoView({block:'center'}); window.scrollBy(0, -80);", apply_btn)
+                driver.execute_script("arguments[0].scrollIntoView({block:'center'}); window.scrollBy(0,-80);", apply_btn)
             except Exception:
                 pass
             try:
                 apply_btn.click()
             except ElementClickInterceptedException:
+                # common cause: overlay or fixed footer; try to close overlays then JS click
+                logging.debug("ElementClickInterceptedException on apply click; trying to close overlays and JS click.")
+                close_overlays(driver)
+                time.sleep(0.2)
                 try:
                     driver.execute_script("arguments[0].click();", apply_btn)
                 except Exception as e:
-                    logging.debug(f"JS click on apply failed: {e}")
+                    logging.debug(f"JS click also failed: {e}")
+                    raise
+            except Exception as e:
+                # fallback JS click
+                try:
+                    driver.execute_script("arguments[0].click();", apply_btn)
+                except Exception:
+                    logging.debug(f"Both normal and JS clicks failed on apply: {e}")
                     raise
             logging.info("Clicked 'Je postule'")
             break
         except Exception as e:
-            logging.debug(f"Attempt {attempt+1} click 'Je postule' failed: {e}")
+            logging.debug(f"Attempt {attempt} click 'Je postule' failed: {e}")
+            time.sleep(0.7)
+            # attempt small scrolls to reveal button
             try:
-                driver.execute_script("window.scrollTo(0, document.body.scrollHeight);")
-                time.sleep(0.2)
-                driver.execute_script("window.scrollTo(0, 0);")
+                driver.execute_script("window.scrollBy(0, 120);")
+                time.sleep(0.15)
+                driver.execute_script("window.scrollBy(0, -120);")
             except Exception:
                 pass
-            time.sleep(0.7)
     else:
+        logging.error("All attempts to click 'Je postule' failed.")
         return False, "apply_click_failed"
 
+    # Confirm if present
     try:
-        confirm_btn = wait.until(EC.element_to_be_clickable((By.XPATH, "//button[contains(.,'Confirmer')]")))
+        confirm_btn = wait.until(EC.element_to_be_clickable((By.XPATH, "//button[contains(.,'Confirmer')]")), timeout=WAIT_TIMEOUT)
         try:
             click_element(driver, confirm_btn)
+            logging.info("Clicked 'Confirmer'")
         except Exception:
-            logging.debug("Confirm click fallback")
-        logging.info("Clicked 'Confirmer'")
-    except TimeoutException:
-        logging.info("No 'Confirmer' button found (maybe not required).")
+            try:
+                driver.execute_script("arguments[0].click();", confirm_btn)
+                logging.info("Clicked 'Confirmer' (JS)")
+            except Exception:
+                logging.debug("Could not click 'Confirmer' (ignored).")
+    except Exception:
+        logging.debug("No 'Confirmer' button found (maybe not required).")
 
+    # OK button sometimes shown
     try:
-        ok_btn = wait.until(EC.element_to_be_clickable((By.XPATH, "//button[normalize-space(.)='Ok' or contains(.,'OK') or contains(.,'Ok')]")))
+        ok_btn = wait.until(EC.element_to_be_clickable((By.XPATH, "//button[normalize-space(.)='Ok' or contains(.,'OK') or contains(.,'Ok')]")), timeout=5)
         try:
             click_element(driver, ok_btn)
+            logging.info("Clicked 'Ok'")
         except Exception:
-            pass
-        logging.info("Clicked 'Ok'")
-    except TimeoutException:
+            try:
+                driver.execute_script("arguments[0].click();", ok_btn)
+            except Exception:
+                logging.debug("Could not click 'Ok' (ignored).")
+    except Exception:
         logging.debug("No final OK button found.")
 
+    # read result text
     try:
         txt = wait.until(EC.presence_of_element_located((By.CSS_SELECTOR, ".text_picto_vert")), timeout=WAIT_TIMEOUT)
         val = txt.text.strip()
         logging.info("Application result text found.")
         return True, val
     except Exception:
-        logging.debug("No application result text found.")
+        logging.debug("No application result text found after apply.")
         return True, "applied_but_no_text"
+
+
+def click_element(driver, el):
+    try:
+        driver.execute_script("arguments[0].scrollIntoView({block: 'center'});", el)
+    except Exception:
+        pass
+    try:
+        el.click()
+        return True
+    except Exception:
+        try:
+            driver.execute_script("arguments[0].click();", el)
+            return True
+        except Exception as e:
+            logging.debug(f"JS click failed: {e}")
+            return False
 
 
 def find_matching_offers_in_section(driver, wait, seen, section_name):
@@ -499,7 +655,7 @@ def main():
         selected_card = None
         selected_info = None
 
-        # priorité : Communes demandées, sinon limitrophes, sinon autres
+        # check Communes demandées first, then others
         matches = find_matching_offers_in_section(driver, wait, seen, "Communes demandées")
         if matches:
             selected_card, selected_info = matches[0]
@@ -534,6 +690,10 @@ def main():
             save_seen(seen)
             return
 
+        # ensure overlays/cookies closed before attempting to apply
+        close_overlays(driver)
+        handle_cookie_banner(driver)
+
         applied, result = robust_click_apply_flow(driver, wait)
         if applied:
             seen.add(uid)
@@ -551,6 +711,11 @@ def main():
             save_seen(seen)
 
     except Exception as e:
+        try:
+            driver.save_screenshot("unhandled_error.png")
+            logging.info("Saved screenshot unhandled_error.png for debugging.")
+        except Exception:
+            pass
         logging.error(f"Unhandled exception in main: {e}")
         send_email("BOTALIN - Unhandled error", f"Unhandled exception: {e}")
     finally:
