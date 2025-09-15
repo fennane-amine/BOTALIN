@@ -301,8 +301,6 @@ def perform_login(driver, wait):
         logging.error(f"Login failed: {e}")
         return False
 
-
-
 def ensure_logged_in(driver, wait):
     if is_logged_in(driver):
         return True
