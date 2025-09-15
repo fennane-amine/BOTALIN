@@ -25,7 +25,7 @@ from selenium import webdriver
 from selenium.webdriver.common.by import By
 from selenium.webdriver.chrome.options import Options
 from selenium.webdriver.chrome.service import Service
-from selenium.common.exceptions import TimeoutException, ElementClickInterceptedException, WebDriverException
+from selenium.common.exceptions import TimeoutException, ElementClickInterceptedException, WebDriverException, NoSuchElementException
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
 
@@ -112,6 +112,21 @@ def load_seen():
     except Exception:
         return set()
 
+def handle_cookie_banner(driver, timeout=5):
+    """
+    Essaie de fermer la pop-in cookies si elle est présente
+    """
+    try:
+        # Attendre que la bannière apparaisse
+        cookie_button = WebDriverWait(driver, timeout).until(
+            EC.element_to_be_clickable((By.XPATH, "//button[contains(., 'Accepter tous les cookies') or contains(., 'Tout accepter')]"))
+        )
+        cookie_button.click()
+        print("✅ Bannière cookies acceptée automatiquement.")
+    except TimeoutException:
+        print("ℹ️ Pas de bannière cookies détectée.")
+    except NoSuchElementException:
+        print("ℹ️ Aucun bouton de cookies trouvé.")
 
 def save_seen(seen_set):
     try:
@@ -295,6 +310,8 @@ def perform_login(driver, wait):
         btn = wait.until(EC.element_to_be_clickable((By.CSS_SELECTOR, "button.btnCreate")))
         driver.execute_script("arguments[0].scrollIntoView(true);", btn)
         btn.click()
+
+        handle_cookie_banner(driver)
 
         # Attendre que la page offres charge
         wait.until(EC.presence_of_element_located((By.CSS_SELECTOR, ".offer-sections")))
