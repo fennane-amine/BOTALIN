@@ -57,7 +57,7 @@ MAX_RUN_SECONDS = int(os.environ.get("MAX_RUN_SECONDS", 300))
 POLL_INTERVAL = int(os.environ.get("POLL_INTERVAL", 15))
 
 # Matching criteria
-MAX_PRICE = int(os.environ.get("MAX_PRICE", 600))
+MAX_PRICE = int(os.environ.get("MAX_PRICE", 550))
 WANTED_TYPOLOGY_KEY = os.environ.get("WANTED_TYPOLOGY_KEY", "T2")
 
 # Scrolling / retries
