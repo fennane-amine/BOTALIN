@@ -281,23 +281,28 @@ def perform_login(driver, wait):
     driver.get(BASE_URL)
     try:
         wait.until(EC.presence_of_element_located((By.CSS_SELECTOR, "form.global-form")))
-        mail_input = wait.until(EC.presence_of_element_located((By.CSS_SELECTOR, 'input[formcontrolname="mail"]')))
-        pwd_input = wait.until(EC.presence_of_element_located((By.CSS_SELECTOR, 'input[formcontrolname="password"]')))
+
+        # Email et mot de passe
+        mail_input = wait.until(EC.presence_of_element_located((By.CSS_SELECTOR, "input[formcontrolname='mail']")))
+        pwd_input = wait.until(EC.presence_of_element_located((By.CSS_SELECTOR, "input[formcontrolname='password']")))
+
         mail_input.clear()
         mail_input.send_keys(EMAIL)
         pwd_input.clear()
         pwd_input.send_keys(PASSWORD)
 
-        # bouton login par classe
+        # Bouton login robuste (par classe btnCreate)
         btn = wait.until(EC.element_to_be_clickable((By.CSS_SELECTOR, "button.btnCreate")))
         driver.execute_script("arguments[0].scrollIntoView(true);", btn)
         btn.click()
 
-        # attendre que la page d'offres charge
+        # Attendre que la page offres charge
         wait.until(EC.presence_of_element_located((By.CSS_SELECTOR, ".offer-sections")))
         logging.info("Login successful.")
         return True
+
     except Exception as e:
+        driver.save_screenshot("login_error.png")  # 👈 pour debug
         logging.error(f"Login failed: {e}")
         return False
 
