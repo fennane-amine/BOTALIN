@@ -6,8 +6,12 @@ permissions:
 on:
   workflow_dispatch:
   schedule:
-    # schedule (cron) example — ajuste si tu veux autre chose
-    - cron: '*/5 4-17 * * *'   # every 5 minutes between 04:00-17:59 UTC (≈06:00-19:59 Paris)
+    # every 5 minutes between 04:00-17:59 UTC -> corresponds to 06:00-19:59 Paris (DST aware)
+    - cron: '*/5 4-17 * * *'
+
+concurrency:
+  group: al-in-bot-run
+  cancel-in-progress: true
 
 jobs:
   run-bot:
@@ -24,7 +28,6 @@ jobs:
         with:
           python-version: '3.11'
 
-      # ----------------- CACHES -----------------
       - name: Cache pip
         uses: actions/cache@v4
         with:
@@ -41,25 +44,12 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-wdm-
 
-      - name: Cache selenium / driver caches (optional)
-        uses: actions/cache@v4
-        with:
-          path: |
-            ~/.cache/selenium
-            ~/.cache
-          key: ${{ runner.os }}-selenium-${{ hashFiles('**/requirements.txt') }}
-          restore-keys: |
-            ${{ runner.os }}-selenium-
-
-      # ----------------- INSTALL -----------------
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip wheel
-          # prefer-binary may speed up by reducing compilation on runner
           pip install --prefer-binary -r requirements.txt
 
-      # ----------------- RUN BOT -----------------
-      - name: Run AL-IN bot (timeout controlled by script)
+      - name: Run AL-IN bot (5 minutes)
         env:
           EMAIL: ${{ secrets.EMAIL }}
           PASSWORD: ${{ secrets.PASSWORD }}
@@ -72,7 +62,6 @@ jobs:
         run: |
           python bot.py
 
-      # ----------------- SAVE FILES -----------------
       - name: Commit offers_seen.json & candidatures_status.json if changed
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
