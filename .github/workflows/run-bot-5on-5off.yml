@@ -7,8 +7,12 @@ permissions:
 on:
   workflow_dispatch:
   schedule:
-    # every 10 minutes between 04:00-17:59 UTC -> corresponds to 06:00-19:59 Paris (DST aware)
-    - cron: '*/2 4-17 * * *'
+    # every 5 minutes (minimum supported by GitHub Actions)
+    - cron: '*/5 * * * *'
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
   run-bot:
@@ -30,7 +34,7 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      - name: Run AL-IN bot (5 minutes)
+      - name: Run AL-IN bot (5 minutes) with Paris time window guard
         env:
           EMAIL: ${{ secrets.EMAIL }}
           PASSWORD: ${{ secrets.PASSWORD }}
@@ -40,6 +44,16 @@ jobs:
           # optional: if you want to use PAT_FOR_PUSH instead of GITHUB_TOKEN, set it in repo secrets
           # PAT_FOR_PUSH: ${{ secrets.PAT_FOR_PUSH }}
         run: |
+          # --- window guard (Europe/Paris) ---
+          # keep the bot active only between 06:00 and 20:00 Paris time (inclusive start, exclusive end)
+          HOUR_PARIS=$(TZ='Europe/Paris' date +'%H')
+          echo "Paris hour: $HOUR_PARIS"
+          if [ "$HOUR_PARIS" -lt 6 ] || [ "$HOUR_PARIS" -ge 20 ]; then
+            echo "Outside 06:00-20:00 Paris window — exiting early."
+            exit 0
+          fi
+
+          # run the bot (should run ~ MAX_RUN_SECONDS)
           python bot.py
 
       - name: Commit offers_seen.json & session_cookies.json if changed
@@ -70,7 +84,7 @@ jobs:
           else
             echo "No files to commit."
           fi
-      
+
       - name: Upload screenshot on failure
         if: failure() || always()
         uses: actions/upload-artifact@v4
