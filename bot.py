@@ -1,8 +1,8 @@
 # bot.py - watcher + apply + email notifications (status-change notifications ONLY, deduped)
 # - Sends email only when a candidature's status changes (or optionally on first-run if SEND_ON_FIRST_RUN=true)
-# - Keeps persistent record of candidature statuses in candidatures_status.json
-# - Retains apply behaviour and the "cancel if rank != 1" best-effort check
-# - Minimal changes to previous structure; improved status extraction to avoid picking dates
+# - Keeps persistent record of candidature statuses in candidatures_status.json (script dir)
+# - Refined status extraction to avoid dates/counts being mistaken for status
+# - Atomic file writes and per-run dedupe of notifications
 #
 # USAGE:
 # - Set site credentials in environment: EMAIL, PASSWORD
@@ -26,6 +26,7 @@ import stat
 import smtplib
 from datetime import datetime, timedelta
 from email.message import EmailMessage
+from tempfile import NamedTemporaryFile
 
 from selenium import webdriver
 from selenium.webdriver.common.by import By
@@ -62,6 +63,10 @@ WAIT_TIMEOUT = int(os.environ.get("WAIT_TIMEOUT", 12))
 HEADLESS = os.environ.get("HEADLESS", "true").lower() in ("1", "true", "yes")
 SEEN_FILE = "offers_seen.json"
 CANDIDATURES_STATUS_FILE = "candidatures_status.json"
+# Ensure status file lives next to the script to avoid CWD differences
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+CANDIDATURES_STATUS_PATH = os.path.join(BASE_DIR, CANDIDATURES_STATUS_FILE)
+
 MAX_RUN_SECONDS = int(os.environ.get("MAX_RUN_SECONDS", 300))
 POLL_INTERVAL = int(os.environ.get("POLL_INTERVAL", 15))
 
@@ -123,7 +128,7 @@ def send_email(subject: str, body: str):
 # ---------- Helpers ----------
 def load_seen():
     try:
-        with open(SEEN_FILE, "r", encoding="utf-8") as f:
+        with open(os.path.join(BASE_DIR, SEEN_FILE), "r", encoding="utf-8") as f:
             return set(json.load(f))
     except Exception:
         return set()
@@ -131,16 +136,19 @@ def load_seen():
 
 def save_seen(seen_set):
     try:
-        with open(SEEN_FILE, "w", encoding="utf-8") as f:
-            json.dump(list(seen_set), f, ensure_ascii=False, indent=2)
-        logging.info(f"Saved {len(seen_set)} seen offers to {SEEN_FILE}")
+        path = os.path.join(BASE_DIR, SEEN_FILE)
+        with NamedTemporaryFile("w", delete=False, dir=BASE_DIR) as tf:
+            json.dump(list(seen_set), tf, ensure_ascii=False, indent=2)
+            tmp = tf.name
+        os.replace(tmp, path)
+        logging.info(f"Saved {len(seen_set)} seen offers to {path}")
     except Exception as e:
         logging.warning(f"Failed to save seen file: {e}")
 
 
 def load_candidatures_statuses():
     try:
-        with open(CANDIDATURES_STATUS_FILE, "r", encoding="utf-8") as f:
+        with open(CANDIDATURES_STATUS_PATH, "r", encoding="utf-8") as f:
             return json.load(f)
     except Exception:
         return {}
@@ -148,9 +156,11 @@ def load_candidatures_statuses():
 
 def save_candidatures_statuses(d):
     try:
-        with open(CANDIDATURES_STATUS_FILE, "w", encoding="utf-8") as f:
-            json.dump(d, f, ensure_ascii=False, indent=2)
-        logging.info(f"Saved {len(d)} candidature statuses to {CANDIDATURES_STATUS_FILE}")
+        with NamedTemporaryFile("w", delete=False, dir=BASE_DIR) as tf:
+            json.dump(d, tf, ensure_ascii=False, indent=2)
+            tmp = tf.name
+        os.replace(tmp, CANDIDATURES_STATUS_PATH)
+        logging.info(f"Saved {len(d)} candidature statuses to {CANDIDATURES_STATUS_PATH}")
     except Exception as e:
         logging.warning(f"Failed to save candidature status file: {e}")
 
@@ -183,11 +193,17 @@ def parse_area(typ_text):
         return None
 
 
+def normalize_status_text(s):
+    """Normalize whitespace and remove stray characters."""
+    if not s:
+        return s
+    s = s.strip()
+    s = re.sub(r"\s+", " ", s)
+    return s
+
+
 # ---------- Cookie / overlays ----------
 def handle_cookie_banner(driver, timeout=5):
-    """
-    Essaie de fermer la pop-in cookies si elle est présente
-    """
     selectors = [
         "//button[contains(., 'Accepter tous les cookies')]",
         "//button[contains(., 'Tout accepter')]",
@@ -517,10 +533,6 @@ def ensure_logged_in(driver, wait):
 
 # ---------- Robust apply flow ----------
 def robust_click_apply_flow(driver, wait):
-    """
-    Attempts to click Apply button robustly, confirm, and fetch result text.
-    Returns (applied_bool, result_text_or_reason)
-    """
     close_overlays(driver)
     handle_cookie_banner(driver)
 
@@ -671,78 +683,101 @@ def extract_candidature_info(cand_elem):
         header = cand_elem.find_element(By.CSS_SELECTOR, ".title")
         header_text = header.text.strip()
     except Exception:
-        # fallback: first non-empty line
         lines = [l.strip() for l in text.splitlines() if l.strip()]
         header_text = lines[0] if lines else ""
 
     # 1) Prefer step-based active/current step title (e.g., "Je postule", "Validations")
     status_text = None
     try:
-        candidates = [
-            ".//div[contains(@class,'steps')]//div[contains(@class,'a-step') and (contains(@class,'current') or contains(@class,'active') )]//div[contains(@class,'step-title')]",
-            ".//div[contains(@class,'steps')]//div[contains(@class,'a-step') and contains(@class,'current')]//div[contains(@class,'step-title')]",
-            ".//div[contains(@class,'steps')]//div[contains(@class,'a-step')]//div[contains(@class,'step-title') and contains(@class,'current')]",
-        ]
-        for xp in candidates:
+        # pick the first step-title that has a 'current' or 'active' ancestor
+        step_nodes = cand_elem.find_elements(By.XPATH, ".//div[contains(@class,'steps')]//div[contains(@class,'a-step')]//div[contains(@class,'step-title')]")
+        for s in step_nodes:
+            stext = s.text.strip()
+            if not stext:
+                continue
+            # filter out date-like strings
+            if re.match(r"\d{1,2}/\d{1,2}/\d{2,4}", stext):
+                continue
+            status_text = stext
+            # prefer ones that have 'current' or 'active' in ancestor class
             try:
-                el = cand_elem.find_element(By.XPATH, xp)
-                txt = el.text.strip()
-                if txt:
-                    status_text = txt
+                parent = s.find_element(By.XPATH, "..")
+                cls = parent.get_attribute("class") or ""
+                if "current" in cls or "active" in cls:
+                    status_text = stext
                     break
             except Exception:
-                continue
+                break
     except Exception:
         pass
 
     # 2) If not found, search for "Statut de la demande" label and pick the following line (strict)
     if not status_text:
         try:
-            label_elems = cand_elem.find_elements(By.XPATH, ".//*[contains(normalize-space(.),'Statut de la demande')]")
-            for label in label_elems:
+            # find nearby span that doesn't look like a date/number/candidate-count
+            label_nodes = cand_elem.find_elements(By.XPATH, ".//*[contains(normalize-space(.),'Statut de la demande')]")
+            for label in label_nodes:
                 try:
                     parent = label.find_element(By.XPATH, "..")
-                    spans = parent.find_elements(By.XPATH, ".//span")
-                    for s in spans:
-                        stext = s.text.strip()
-                        if stext and not re.search(r"\d{1,2}/\d{1,2}/\d{2,4}", stext):
-                            status_text = stext
-                            break
+                    # look for .data or .text elements under parent
+                    candidates = parent.find_elements(By.XPATH, ".//span | .//div")
+                    for c in candidates:
+                        stext = c.text.strip()
+                        if not stext:
+                            continue
+                        # avoid picking date or counts (e.g., 'Il y a actuellement 221 candidatures...')
+                        if re.match(r"\d{1,2}/\d{1,2}/\d{2,4}", stext):
+                            continue
+                        if re.search(r"candidat|candidature|candidatures", stext, re.IGNORECASE):
+                            continue
+                        # safe
+                        status_text = stext
+                        break
                     if status_text:
                         break
                 except Exception:
                     continue
-            if not status_text:
-                lines = [l.strip() for l in text.splitlines() if l.strip()]
-                for i, line in enumerate(lines):
-                    if "Statut de la demande" in line:
-                        if i + 1 < len(lines):
-                            cand_line = lines[i + 1]
-                            if not re.match(r"\d{1,2}/\d{1,2}/\d{2,4}", cand_line):
-                                status_text = cand_line
-                        break
         except Exception:
             pass
 
-    # 3) Another fallback: try to pick .data.red but avoid picking date or counts
+    # 3) Another fallback: pick .data.red but avoid dates and counts
     if not status_text:
         try:
-            data_spans = cand_elem.find_elements(By.CSS_SELECTOR, ".data, .data.red")
+            data_spans = cand_elem.find_elements(By.CSS_SELECTOR, ".data, .data.red, .text_picto_vert")
             for s in data_spans:
                 st = s.text.strip()
                 if not st:
                     continue
+                # filter out known unwanted patterns
                 if "candidat" in st.lower() or "candidatures" in st.lower():
                     continue
                 if re.match(r"\d{1,2}/\d{1,2}/\d{2,4}", st):
+                    continue
+                if re.match(r"^\d+$", st):
                     continue
                 status_text = st
                 break
         except Exception:
             pass
 
+    # last fallback: scan visible lines but avoid dates and counts
+    if not status_text:
+        lines = [l.strip() for l in text.splitlines() if l.strip()]
+        for line in lines:
+            if re.match(r"\d{1,2}/\d{1,2}/\d{2,4}", line):
+                continue
+            if re.search(r"candidat|candidature|candidatures", line, re.IGNORECASE):
+                continue
+            if len(line) < 3:
+                continue
+            status_text = line
+            break
+
     if not status_text:
         status_text = "Unknown"
+
+    # normalize
+    status_text = normalize_status_text(status_text)
 
     # attempt to parse rank (search in text for 'Position' or 'position' and a number)
     rank = None
@@ -809,6 +844,7 @@ def process_candidatures_and_notify(driver, wait, candid_statuses, send_notifica
 
     current_map = dict(candid_statuses)
     processed_uids = set()
+    sent_in_run = set()
     changed_items = []
 
     for elem in cand_elems:
@@ -823,6 +859,12 @@ def process_candidatures_and_notify(driver, wait, candid_statuses, send_notifica
             rank = info.get("rank")
             prev = candid_statuses.get(uid)
 
+            # Do not treat date-like statuses as real status change:
+            if re.match(r"\d{1,2}/\d{1,2}/\d{2,4}$", status):
+                # likely a date (date-limit), ignore as status; fall back to Unknown
+                logging.debug(f"Ignoring date-like status for uid={uid}: {status}")
+                status = "Unknown"
+
             should_send = False
             if send_notifications:
                 if prev is not None:
@@ -833,12 +875,12 @@ def process_candidatures_and_notify(driver, wait, candid_statuses, send_notifica
                     if send_on_first_run:
                         should_send = True
 
-            if should_send:
+            if should_send and uid not in sent_in_run:
                 subject = f"BOTALIN - Candidature statut mis à jour: {status}"
                 body_lines = [
                     f"Candidature: {info['header'] or uid}",
                     "",
-                    f"Element text snapshot:",
+                    "Element text snapshot:",
                     info["full_text"],
                     "",
                     f"Nouveau statut: {status}",
@@ -852,8 +894,9 @@ def process_candidatures_and_notify(driver, wait, candid_statuses, send_notifica
                     logging.warning(f"Failed sending candidature status email for uid={uid}")
                 current_map[uid] = status
                 changed_items.append((uid, prev, status, rank))
+                sent_in_run.add(uid)
             else:
-                # still persist new candidatures (so no repeated "None->status" emails unless send_on_first_run True)
+                # persist new candidatures (so no repeated None->status emails unless send_on_first_run True)
                 if prev is None:
                     current_map[uid] = status
         except Exception as e:
@@ -863,8 +906,8 @@ def process_candidatures_and_notify(driver, wait, candid_statuses, send_notifica
     if changed_items:
         save_candidatures_statuses(current_map)
 
-    # If no saved statuses existed before (first-run), ensure we save the initial map to avoid repeated emails later
     if not candid_statuses and current_map:
+        # first run: persist initial states (and only send email if explicit env var enabled)
         save_candidatures_statuses(current_map)
 
     return current_map, changed_items
@@ -907,7 +950,7 @@ def main():
     candid_statuses = load_candidatures_statuses()
     initial_scan = (len(candid_statuses) == 0)
     logging.info(f"Loaded {len(seen)} seen offers (from {SEEN_FILE} if present)")
-    logging.info(f"Loaded {len(candid_statuses)} saved candidature statuses (from {CANDIDATURES_STATUS_FILE} if present). initial_scan={initial_scan}")
+    logging.info(f"Loaded {len(candid_statuses)} saved candidature statuses (from {CANDIDATURES_STATUS_PATH} if present). initial_scan={initial_scan}")
 
     try:
         driver = init_driver()
