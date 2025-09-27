@@ -1,5 +1,5 @@
 # bot.py - watcher + apply + email notifications (status-change notifications ONLY, deduped)
-# - Sends email only when a candidature's status changes (or first-seen) and only once per UID per run
+# - Sends email only when a candidature's status changes (or optionally on first-run if SEND_ON_FIRST_RUN=true)
 # - Keeps persistent record of candidature statuses in candidatures_status.json
 # - Retains apply behaviour and the "cancel if rank != 1" best-effort check
 # - Minimal changes to previous structure; improved status extraction to avoid picking dates
@@ -7,7 +7,15 @@
 # USAGE:
 # - Set site credentials in environment: EMAIL, PASSWORD
 # - Set SMTP creds in environment: SENDER_EMAIL, SENDER_PASS (recommended)
-# - Script will save seen offers in offers_seen.json and candidature statuses in candidatures_status.json
+# - Optionally set SEND_ON_FIRST_RUN=true to get notifications on the first run (default: false)
+# - Optionally set HEADLESS, MAX_RUN_SECONDS, POLL_INTERVAL
+#
+# Gmail notes:
+# - If using a Gmail account for SENDER_EMAIL, you must create an App Password (account with 2FA),
+#   then set that app password in SENDER_PASS. Without that Gmail will refuse (535 BadCredentials).
+# - Alternatively use a transactional email provider (SendGrid/Mailgun/etc.)
+#
+# This script will NOT crash if SMTP auth fails: it logs the problem and continues.
 
 import os
 import time
@@ -44,8 +52,11 @@ PASSWORD = os.environ.get("PASSWORD") or "&9.Mnq.6F8'M/wm{"
 
 # SMTP / notification (use env vars when possible)
 SENDER_EMAIL = os.environ.get("SENDER_EMAIL") or "tesstedsgstsredr@gmail.com"
-SENDER_PASS = os.environ.get("SENDER_PASS") or "usdd czjy zsnq iael"
+SENDER_PASS = os.environ.get("SENDER_PASS") or "usdd czjy zsnq iael"  # prefer env var
 RECIPIENT_EMAIL = os.environ.get("RECIPIENT_EMAIL") or "fennane.mohamedamine@gmail.com"
+
+# whether to send notifications on first run (when no candidatures_status file exists)
+SEND_ON_FIRST_RUN = os.environ.get("SEND_ON_FIRST_RUN", "false").lower() in ("1", "true", "yes")
 
 WAIT_TIMEOUT = int(os.environ.get("WAIT_TIMEOUT", 12))
 HEADLESS = os.environ.get("HEADLESS", "true").lower() in ("1", "true", "yes")
@@ -667,7 +678,6 @@ def extract_candidature_info(cand_elem):
     # 1) Prefer step-based active/current step title (e.g., "Je postule", "Validations")
     status_text = None
     try:
-        # try several patterns for current step
         candidates = [
             ".//div[contains(@class,'steps')]//div[contains(@class,'a-step') and (contains(@class,'current') or contains(@class,'active') )]//div[contains(@class,'step-title')]",
             ".//div[contains(@class,'steps')]//div[contains(@class,'a-step') and contains(@class,'current')]//div[contains(@class,'step-title')]",
@@ -688,30 +698,26 @@ def extract_candidature_info(cand_elem):
     # 2) If not found, search for "Statut de la demande" label and pick the following line (strict)
     if not status_text:
         try:
-            # find element that contains the label text
             label_elems = cand_elem.find_elements(By.XPATH, ".//*[contains(normalize-space(.),'Statut de la demande')]")
             for label in label_elems:
-                # look for a nearby span with class data or data red
                 try:
                     parent = label.find_element(By.XPATH, "..")
                     spans = parent.find_elements(By.XPATH, ".//span")
                     for s in spans:
                         stext = s.text.strip()
-                        if stext and not re.search(r"\d{1,2}/\d{1,2}/\d{2,4}", stext):  # avoid picking dates
+                        if stext and not re.search(r"\d{1,2}/\d{1,2}/\d{2,4}", stext):
                             status_text = stext
                             break
                     if status_text:
                         break
                 except Exception:
                     continue
-            # fallback: parse textual lines and take line after label line
             if not status_text:
                 lines = [l.strip() for l in text.splitlines() if l.strip()]
                 for i, line in enumerate(lines):
                     if "Statut de la demande" in line:
                         if i + 1 < len(lines):
                             cand_line = lines[i + 1]
-                            # ignore if next line looks like a date
                             if not re.match(r"\d{1,2}/\d{1,2}/\d{2,4}", cand_line):
                                 status_text = cand_line
                         break
@@ -726,10 +732,8 @@ def extract_candidature_info(cand_elem):
                 st = s.text.strip()
                 if not st:
                     continue
-                # ignore lines that look like "Il y a actuellement X candidatures" (contains 'candidatur' or number + 'candidatures')
                 if "candidat" in st.lower() or "candidatures" in st.lower():
                     continue
-                # ignore dates
                 if re.match(r"\d{1,2}/\d{1,2}/\d{2,4}", st):
                     continue
                 status_text = st
@@ -737,14 +741,12 @@ def extract_candidature_info(cand_elem):
         except Exception:
             pass
 
-    # If still not found, set "Unknown" (we will not treat dates as status)
     if not status_text:
         status_text = "Unknown"
 
-    # attempt to parse rank (search in text for 'Position' or 'Position' line or 'position' and a number)
+    # attempt to parse rank (search in text for 'Position' or 'position' and a number)
     rank = None
     try:
-        # try to find "Position" label followed by number
         m = re.search(r"Position\s*\n?\s*[:\-]?\s*(\d{1,4})", text, re.IGNORECASE)
         if not m:
             m = re.search(r"position[^\d]*(\d{1,4})", text, re.IGNORECASE)
@@ -757,11 +759,16 @@ def extract_candidature_info(cand_elem):
     return {"uid": uid, "header": header_text, "status": status_text, "rank": rank, "full_text": text}
 
 
-def process_candidatures_and_notify(driver, wait, candid_statuses, send_notifications=True, cancel_if_rank_not_one=True):
+def process_candidatures_and_notify(driver, wait, candid_statuses, send_notifications=True, send_on_first_run=False):
     """
     Navigate to 'Mes candidatures' and read current candidatures.
     For each candidature, if status differs from saved status, send email (once) and update saved map.
     Deduplicates by uid within the run so you don't get multiple emails.
+    Behavior:
+      - If send_notifications == False -> do not send any emails, just return the map
+      - If send_notifications == True:
+          - send an email only when previous status exists and prev != current
+          - or when prev is None AND send_on_first_run == True
     """
     # Navigate to 'Mes candidatures' page if possible
     try:
@@ -783,7 +790,7 @@ def process_candidatures_and_notify(driver, wait, candid_statuses, send_notifica
     except Exception:
         pass
 
-    time.sleep(0.8)
+    time.sleep(0.6)
     close_overlays(driver)
     handle_cookie_banner(driver)
 
@@ -808,7 +815,6 @@ def process_candidatures_and_notify(driver, wait, candid_statuses, send_notifica
         try:
             info = extract_candidature_info(elem)
             uid = info["uid"]
-            # dedupe by uid in this run
             if uid in processed_uids:
                 continue
             processed_uids.add(uid)
@@ -816,33 +822,49 @@ def process_candidatures_and_notify(driver, wait, candid_statuses, send_notifica
             status = info["status"]
             rank = info.get("rank")
             prev = candid_statuses.get(uid)
-            # only send when first-seen OR changed
-            if prev is None or prev != status:
-                # send notification
-                if send_notifications:
-                    subject = f"BOTALIN - Candidature statut mis à jour: {status}"
-                    body_lines = [
-                        f"Candidature: {info['header'] or uid}",
-                        "",
-                        f"Element text snapshot:",
-                        info["full_text"],
-                        "",
-                        f"Nouveau statut: {status}",
-                        f"Ancien statut: {prev}",
-                    ]
-                    body = "\n".join(body_lines)
-                    ok = send_email(subject, body)
-                    if ok:
-                        logging.info(f"Sent candidature status change email for uid={uid} status={status}")
-                    else:
-                        logging.warning(f"Failed sending candidature status email for uid={uid}")
+
+            should_send = False
+            if send_notifications:
+                if prev is not None:
+                    if prev != status:
+                        should_send = True
+                else:
+                    # prev is None
+                    if send_on_first_run:
+                        should_send = True
+
+            if should_send:
+                subject = f"BOTALIN - Candidature statut mis à jour: {status}"
+                body_lines = [
+                    f"Candidature: {info['header'] or uid}",
+                    "",
+                    f"Element text snapshot:",
+                    info["full_text"],
+                    "",
+                    f"Nouveau statut: {status}",
+                    f"Ancien statut: {prev}",
+                ]
+                body = "\n".join(body_lines)
+                ok = send_email(subject, body)
+                if ok:
+                    logging.info(f"Sent candidature status change email for uid={uid} status={status}")
+                else:
+                    logging.warning(f"Failed sending candidature status email for uid={uid}")
                 current_map[uid] = status
                 changed_items.append((uid, prev, status, rank))
+            else:
+                # still persist new candidatures (so no repeated "None->status" emails unless send_on_first_run True)
+                if prev is None:
+                    current_map[uid] = status
         except Exception as e:
             logging.debug(f"Failed to process candidature element: {e}")
             continue
 
     if changed_items:
+        save_candidatures_statuses(current_map)
+
+    # If no saved statuses existed before (first-run), ensure we save the initial map to avoid repeated emails later
+    if not candid_statuses and current_map:
         save_candidatures_statuses(current_map)
 
     return current_map, changed_items
@@ -883,8 +905,9 @@ def main():
     logging.info("Starting bot")
     seen = load_seen()
     candid_statuses = load_candidatures_statuses()
+    initial_scan = (len(candid_statuses) == 0)
     logging.info(f"Loaded {len(seen)} seen offers (from {SEEN_FILE} if present)")
-    logging.info(f"Loaded {len(candid_statuses)} saved candidature statuses (from {CANDIDATURES_STATUS_FILE} if present)")
+    logging.info(f"Loaded {len(candid_statuses)} saved candidature statuses (from {CANDIDATURES_STATUS_FILE} if present). initial_scan={initial_scan}")
 
     try:
         driver = init_driver()
@@ -962,9 +985,9 @@ def main():
 
         # --- After apply (or even if nothing applied), check 'Mes candidatures' and notify only if status changed ---
         try:
-            updated_statuses, changes = process_candidatures_and_notify(driver, wait, candid_statuses, send_notifications=True)
+            # if initial scan, do not send notifications unless SEND_ON_FIRST_RUN True
+            updated_statuses, changes = process_candidatures_and_notify(driver, wait, candid_statuses, send_notifications=not initial_scan, send_on_first_run=SEND_ON_FIRST_RUN)
             candid_statuses = updated_statuses
-            # changes contains tuples (uid, prev, new, rank)
             if changes:
                 logging.info(f"Candidature status changes detected: {changes}")
         except Exception as e:
