@@ -1,8 +1,8 @@
-# bot.py - watcher + apply + email notifications (status-change notifications ONLY)
-# - Sends email only when a candidature's status changes (or first-seen)
+# bot.py - watcher + apply + email notifications (status-change notifications ONLY, deduped)
+# - Sends email only when a candidature's status changes (or first-seen) and only once per UID per run
 # - Keeps persistent record of candidature statuses in candidatures_status.json
 # - Retains apply behaviour and the "cancel if rank != 1" best-effort check
-# - Minimal changes to previous structure; drop noisy repeated notifications
+# - Minimal changes to previous structure; improved status extraction to avoid picking dates
 #
 # USAGE:
 # - Set site credentials in environment: EMAIL, PASSWORD
@@ -55,9 +55,9 @@ MAX_RUN_SECONDS = int(os.environ.get("MAX_RUN_SECONDS", 300))
 POLL_INTERVAL = int(os.environ.get("POLL_INTERVAL", 15))
 
 # Matching criteria
-MAX_PRICE = int(os.environ.get("MAX_PRICE", 600))  # user asked for 600 originally; override via env
+MAX_PRICE = int(os.environ.get("MAX_PRICE", 600))  # default 600
 WANTED_TYPOLOGY_KEY = os.environ.get("WANTED_TYPOLOGY_KEY", "T2")
-MIN_AREA_M2 = int(os.environ.get("MIN_AREA_M2", 40))  # user asked for min 40m2
+MIN_AREA_M2 = int(os.environ.get("MIN_AREA_M2", 40))  # default 40m2
 
 # Scrolling / retries
 CLICK_RETRIES = int(os.environ.get("CLICK_RETRIES", 5))
@@ -163,7 +163,7 @@ def parse_area(typ_text):
     """
     if not typ_text:
         return None
-    m = re.search(r"(\d{2,3})\s*m", typ_text.replace("²", ""))
+    m = re.search(r"(\d{2,3})\s*m", typ_text.replace("²", "").replace("M", "m"))
     if not m:
         return None
     try:
@@ -172,6 +172,7 @@ def parse_area(typ_text):
         return None
 
 
+# ---------- Cookie / overlays ----------
 def handle_cookie_banner(driver, timeout=5):
     """
     Essaie de fermer la pop-in cookies si elle est présente
@@ -227,6 +228,7 @@ def close_overlays(driver):
             continue
 
 
+# ---------- Offer list helpers ----------
 def find_section_button(driver, name):
     xpath = f"//div[contains(@class,'offer-sections')]//div[contains(normalize-space(.),'{name}')]"
     try:
@@ -609,6 +611,7 @@ def robust_click_apply_flow(driver, wait):
         return True, "applied_but_no_text"
 
 
+# ---------- Matching & find ----------
 def find_matching_offers_in_section(driver, wait, seen, section_name):
     found = []
     btn = find_section_button(driver, section_name)
@@ -651,47 +654,105 @@ def extract_candidature_info(cand_elem):
     Return dict with keys: uid, header_text, status_text, rank (int or None), full_text
     """
     text = cand_elem.text or ""
-    # attempt to locate a header/title like "T2 | Les Essarts-le-Roi (78) | 497 €"
+    # header/title
     header_text = ""
     try:
         header = cand_elem.find_element(By.CSS_SELECTOR, ".title")
         header_text = header.text.strip()
     except Exception:
-        # fallback: take first line of element text
-        header_text = (text.splitlines()[0] if text else "")
+        # fallback: first non-empty line
+        lines = [l.strip() for l in text.splitlines() if l.strip()]
+        header_text = lines[0] if lines else ""
 
-    # attempt to get explicit status element ".data.red" under "Statut de la demande"
+    # 1) Prefer step-based active/current step title (e.g., "Je postule", "Validations")
     status_text = None
     try:
-        status_el = cand_elem.find_element(By.XPATH, ".//div[contains(.,'Statut de la demande')]/following-sibling::div//span")
-        status_text = status_el.text.strip()
-    except Exception:
-        # fallback: find .data elements
-        try:
-            status_el = cand_elem.find_element(By.CSS_SELECTOR, ".data.red")
-            status_text = status_el.text.strip()
-        except Exception:
-            # fallback: find step with current/active class
+        # try several patterns for current step
+        candidates = [
+            ".//div[contains(@class,'steps')]//div[contains(@class,'a-step') and (contains(@class,'current') or contains(@class,'active') )]//div[contains(@class,'step-title')]",
+            ".//div[contains(@class,'steps')]//div[contains(@class,'a-step') and contains(@class,'current')]//div[contains(@class,'step-title')]",
+            ".//div[contains(@class,'steps')]//div[contains(@class,'a-step')]//div[contains(@class,'step-title') and contains(@class,'current')]",
+        ]
+        for xp in candidates:
             try:
-                step = cand_elem.find_element(By.CSS_SELECTOR, ".steps .a-step.current .step-title")
-                status_text = step.text.strip()
+                el = cand_elem.find_element(By.XPATH, xp)
+                txt = el.text.strip()
+                if txt:
+                    status_text = txt
+                    break
             except Exception:
-                # last fallback: try to regex on text for "Statut de la demande" line
-                m = re.search(r"Statut de la demande\s*\n\s*(.+)", text, re.IGNORECASE)
-                if m:
-                    status_text = m.group(1).strip()
-    status_text = status_text or "Unknown"
+                continue
+    except Exception:
+        pass
 
-    # attempt to parse rank (search in text for 'position' and a number)
-    rank = None
-    mpos = re.search(r"position[^\d]*(\d{1,4})", text, re.IGNORECASE)
-    if mpos:
+    # 2) If not found, search for "Statut de la demande" label and pick the following line (strict)
+    if not status_text:
         try:
-            rank = int(mpos.group(1))
-        except:
-            rank = None
+            # find element that contains the label text
+            label_elems = cand_elem.find_elements(By.XPATH, ".//*[contains(normalize-space(.),'Statut de la demande')]")
+            for label in label_elems:
+                # look for a nearby span with class data or data red
+                try:
+                    parent = label.find_element(By.XPATH, "..")
+                    spans = parent.find_elements(By.XPATH, ".//span")
+                    for s in spans:
+                        stext = s.text.strip()
+                        if stext and not re.search(r"\d{1,2}/\d{1,2}/\d{2,4}", stext):  # avoid picking dates
+                            status_text = stext
+                            break
+                    if status_text:
+                        break
+                except Exception:
+                    continue
+            # fallback: parse textual lines and take line after label line
+            if not status_text:
+                lines = [l.strip() for l in text.splitlines() if l.strip()]
+                for i, line in enumerate(lines):
+                    if "Statut de la demande" in line:
+                        if i + 1 < len(lines):
+                            cand_line = lines[i + 1]
+                            # ignore if next line looks like a date
+                            if not re.match(r"\d{1,2}/\d{1,2}/\d{2,4}", cand_line):
+                                status_text = cand_line
+                        break
+        except Exception:
+            pass
 
-    # Build uid: use header_text if present, else fallback to first few lines
+    # 3) Another fallback: try to pick .data.red but avoid picking date or counts
+    if not status_text:
+        try:
+            data_spans = cand_elem.find_elements(By.CSS_SELECTOR, ".data, .data.red")
+            for s in data_spans:
+                st = s.text.strip()
+                if not st:
+                    continue
+                # ignore lines that look like "Il y a actuellement X candidatures" (contains 'candidatur' or number + 'candidatures')
+                if "candidat" in st.lower() or "candidatures" in st.lower():
+                    continue
+                # ignore dates
+                if re.match(r"\d{1,2}/\d{1,2}/\d{2,4}", st):
+                    continue
+                status_text = st
+                break
+        except Exception:
+            pass
+
+    # If still not found, set "Unknown" (we will not treat dates as status)
+    if not status_text:
+        status_text = "Unknown"
+
+    # attempt to parse rank (search in text for 'Position' or 'Position' line or 'position' and a number)
+    rank = None
+    try:
+        # try to find "Position" label followed by number
+        m = re.search(r"Position\s*\n?\s*[:\-]?\s*(\d{1,4})", text, re.IGNORECASE)
+        if not m:
+            m = re.search(r"position[^\d]*(\d{1,4})", text, re.IGNORECASE)
+        if m:
+            rank = int(m.group(1))
+    except Exception:
+        rank = None
+
     uid = header_text or (text.splitlines()[0] if text else str(hash(text)))
     return {"uid": uid, "header": header_text, "status": status_text, "rank": rank, "full_text": text}
 
@@ -699,15 +760,13 @@ def extract_candidature_info(cand_elem):
 def process_candidatures_and_notify(driver, wait, candid_statuses, send_notifications=True, cancel_if_rank_not_one=True):
     """
     Navigate to 'Mes candidatures' and read current candidatures.
-    For each candidature, if status differs from saved status, send email and update saved map.
-    If cancel_if_rank_not_one True and rank detected != 1 for recently applied UID, cancel the candidature.
-    Returns updated candid_statuses dict.
+    For each candidature, if status differs from saved status, send email (once) and update saved map.
+    Deduplicates by uid within the run so you don't get multiple emails.
     """
     # Navigate to 'Mes candidatures' page if possible
     try:
-        # look for link/button "Mes candidatures"
         try:
-            mc = driver.find_element(By.XPATH, "//a[contains(.,'Mes candidatures') or //button[contains(.,'Mes candidatures')]]")
+            mc = driver.find_element(By.XPATH, "//a[contains(.,'Mes candidatures') or contains(.,'Mes candidatures')]")
             try:
                 click_element(driver, mc)
             except Exception:
@@ -716,7 +775,6 @@ def process_candidatures_and_notify(driver, wait, candid_statuses, send_notifica
                 except Exception:
                     pass
         except Exception:
-            # maybe accessible via profile menu; just try to open a known route
             try:
                 driver.get("https://al-in.fr/#/mes-candidatures")
             except Exception:
@@ -725,37 +783,42 @@ def process_candidatures_and_notify(driver, wait, candid_statuses, send_notifica
     except Exception:
         pass
 
-    # Wait a bit and close overlays
     time.sleep(0.8)
     close_overlays(driver)
     handle_cookie_banner(driver)
 
-    # Collect candidature elements (class 'tdb-s-candidature' appears in sample)
+    # gather candidature elements
     cand_elems = []
     try:
-        cand_elems = driver.find_elements(By.CSS_SELECTOR, ".tdb-s-candidature, .info-candidatures, .tdb-s-candidature .info-candidatures")
+        cand_elems = driver.find_elements(By.CSS_SELECTOR, ".tdb-s-candidature, .info-candidatures")
     except Exception:
         cand_elems = []
 
-    # If none found, try a broader selector
     if not cand_elems:
         try:
-            cand_elems = driver.find_elements(By.CSS_SELECTOR, ".info-candidatures")
+            cand_elems = driver.find_elements(By.CSS_SELECTOR, ".tdb-s-candidature")
         except Exception:
             cand_elems = []
 
-    current_map = dict(candid_statuses)  # copy
+    current_map = dict(candid_statuses)
+    processed_uids = set()
     changed_items = []
 
     for elem in cand_elems:
         try:
             info = extract_candidature_info(elem)
             uid = info["uid"]
+            # dedupe by uid in this run
+            if uid in processed_uids:
+                continue
+            processed_uids.add(uid)
+
             status = info["status"]
             rank = info.get("rank")
             prev = candid_statuses.get(uid)
-            if prev != status:
-                # send notification once
+            # only send when first-seen OR changed
+            if prev is None or prev != status:
+                # send notification
                 if send_notifications:
                     subject = f"BOTALIN - Candidature statut mis à jour: {status}"
                     body_lines = [
@@ -779,28 +842,25 @@ def process_candidatures_and_notify(driver, wait, candid_statuses, send_notifica
             logging.debug(f"Failed to process candidature element: {e}")
             continue
 
-    # Save updated statuses
     if changed_items:
         save_candidatures_statuses(current_map)
 
     return current_map, changed_items
 
 
-# ---------- Cancel candidature flow (best-effort) ----------
+# ---------- Cancel candidature flow ----------
 def cancel_candidature_by_element(driver, wait, cand_elem):
     """
     Click the 'Annuler cette candidature' link inside cand_elem and confirm the dialog.
     Return True if appears cancelled (best-effort).
     """
     try:
-        # find cancel anchor/link
         try:
             cancel_link = cand_elem.find_element(By.XPATH, ".//a[contains(.,'Annuler') or contains(.,'Annuler cette candidature')]")
         except Exception:
             cancel_link = cand_elem.find_element(By.CSS_SELECTOR, "a.tool-link.hi-cross-round")
         click_element(driver, cancel_link)
         time.sleep(0.4)
-        # Wait for dialog and click 'Oui'
         try:
             yes_btn = WebDriverWait(driver, 6).until(EC.element_to_be_clickable((By.XPATH, "//button[normalize-space(.)='Oui' or contains(.,'Oui')]")))
             try:
@@ -840,7 +900,6 @@ def main():
             send_email("BOTALIN - Login failed", "The bot could not log in with provided credentials.")
             return
 
-        # --- Searching & applying behavior (prioritize Communes demandées) ---
         sections_priority = [
             "Communes demandées",
             "Communes limitrophes",
@@ -881,7 +940,6 @@ def main():
                 send_email("BOTALIN - Open offer failed", f"Failed to open offer detail: {info}\nException: {e}")
                 seen.add(uid)
                 save_seen(seen)
-                # continue to candidature monitoring below
                 selected_card = None
 
             if selected_card:
@@ -890,7 +948,6 @@ def main():
                     applied_uid = uid
                     seen.add(uid)
                     save_seen(seen)
-                    # notify application
                     subject = f"BOTALIN - Applied to offer ({info['loc']})"
                     body = f"Applied to: {info}\nResult: {result}"
                     ok_email = send_email(subject, body)
@@ -907,15 +964,16 @@ def main():
         try:
             updated_statuses, changes = process_candidatures_and_notify(driver, wait, candid_statuses, send_notifications=True)
             candid_statuses = updated_statuses
+            # changes contains tuples (uid, prev, new, rank)
+            if changes:
+                logging.info(f"Candidature status changes detected: {changes}")
         except Exception as e:
             logging.warning(f"Failed to process candidatures: {e}")
 
         # If we just applied and cancel-if-rank-not-one is desired, attempt to find the new candidature and cancel if rank != 1
         if applied_uid:
-            # re-scan candidatures to find applied_uid element and rank
             time.sleep(1)
             try:
-                # find candidature elements again
                 cand_elems = driver.find_elements(By.CSS_SELECTOR, ".tdb-s-candidature, .info-candidatures")
                 for elem in cand_elems:
                     try:
@@ -924,12 +982,10 @@ def main():
                             rank = info.get("rank")
                             logging.info(f"Applied candidature found with rank={rank}")
                             if rank is not None and rank != 1:
-                                # cancel
                                 ok_cancel = cancel_candidature_by_element(driver, wait, elem)
                                 if ok_cancel:
                                     logging.info("Cancelled candidature because rank != 1")
                                     send_email("BOTALIN - Candidature cancelled", f"Cancelled candidature for {info['header']} because rank={rank} != 1")
-                                    # mark as seen (already done) and update statuses (remove or mark cancelled)
                                     candid_statuses[applied_uid] = "Cancelled_by_bot"
                                     save_candidatures_statuses(candid_statuses)
                                 else:
