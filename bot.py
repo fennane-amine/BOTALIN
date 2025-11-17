@@ -1,22 +1,5 @@
-# bot.py - watcher + apply + email notifications (status-change notifications ONLY, deduped)
-# - Sends email only when a candidature's status changes (or optionally on first-run if SEND_ON_FIRST_RUN=true)
-# - Keeps persistent record of candidature statuses in candidatures_status.json (script dir)
-# - Refined status extraction to avoid dates/counts being mistaken for status
-# - Atomic file writes and per-run dedupe of notifications
-#
-# USAGE:
-# - Set site credentials in environment: EMAIL, PASSWORD
-# - Set SMTP creds in environment: SENDER_EMAIL, SENDER_PASS (recommended)
-# - Optionally set SEND_ON_FIRST_RUN=true to get notifications on the first run (default: false)
-# - Optionally set HEADLESS, MAX_RUN_SECONDS, POLL_INTERVAL
-#
-# Gmail notes:
-# - If using a Gmail account for SENDER_EMAIL, you must create an App Password (account with 2FA),
-#   then set that app password in SENDER_PASS. Without that Gmail will refuse (535 BadCredentials).
-# - Alternatively use a transactional email provider (SendGrid/Mailgun/etc.)
-#
-# This script will NOT crash if SMTP auth fails: it logs the problem and continues.
-
+# bot.py - watcher + apply + candidature status tracking + email notifications
+# Full merged version requested by user.
 import os
 import time
 import json
@@ -26,7 +9,6 @@ import stat
 import smtplib
 from datetime import datetime, timedelta
 from email.message import EmailMessage
-from tempfile import NamedTemporaryFile
 
 from selenium import webdriver
 from selenium.webdriver.common.by import By
@@ -47,33 +29,28 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(
 
 # ---------- CONFIG ----------
 BASE_URL = "https://al-in.fr/#/connexion-demandeur"
-# site login (keep as env)
+
+# site login (prefer env)
 EMAIL = os.environ.get("EMAIL") or "mohamed-amine.fennane@epita.fr"
 PASSWORD = os.environ.get("PASSWORD") or "&9.Mnq.6F8'M/wm{"
 
-# SMTP / notification (use env vars when possible)
+# SMTP / notification (prefer env)
 SENDER_EMAIL = os.environ.get("SENDER_EMAIL") or "tesstedsgstsredr@gmail.com"
 SENDER_PASS = os.environ.get("SENDER_PASS") or "usdd czjy zsnq iael"  # prefer env var
 RECIPIENT_EMAIL = os.environ.get("RECIPIENT_EMAIL") or "fennane.mohamedamine@gmail.com"
 
-# whether to send notifications on first run (when no candidatures_status file exists)
-SEND_ON_FIRST_RUN = os.environ.get("SEND_ON_FIRST_RUN", "false").lower() in ("1", "true", "yes")
-
+# Timing & runtime
 WAIT_TIMEOUT = int(os.environ.get("WAIT_TIMEOUT", 12))
 HEADLESS = os.environ.get("HEADLESS", "true").lower() in ("1", "true", "yes")
 SEEN_FILE = "offers_seen.json"
-CANDIDATURES_STATUS_FILE = "candidatures_status.json"
-# Ensure status file lives next to the script to avoid CWD differences
-BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-CANDIDATURES_STATUS_PATH = os.path.join(BASE_DIR, CANDIDATURES_STATUS_FILE)
-
+CANDIDATURES_FILE = "candidatures_status.json"
 MAX_RUN_SECONDS = int(os.environ.get("MAX_RUN_SECONDS", 300))
 POLL_INTERVAL = int(os.environ.get("POLL_INTERVAL", 15))
 
 # Matching criteria
-MAX_PRICE = int(os.environ.get("MAX_PRICE", 600))  # default 600
+MAX_PRICE = int(os.environ.get("MAX_PRICE", 600))  # user requested 600 / later said 600 -> keep configurable
+MIN_AREA = int(os.environ.get("MIN_AREA", 40))    # user requested min 40 m2
 WANTED_TYPOLOGY_KEY = os.environ.get("WANTED_TYPOLOGY_KEY", "T2")
-MIN_AREA_M2 = int(os.environ.get("MIN_AREA_M2", 40))  # default 40m2
 
 # Scrolling / retries
 CLICK_RETRIES = int(os.environ.get("CLICK_RETRIES", 5))
@@ -125,10 +102,10 @@ def send_email(subject: str, body: str):
     return False
 
 
-# ---------- Helpers ----------
+# ---------- Helpers (files, parsing) ----------
 def load_seen():
     try:
-        with open(os.path.join(BASE_DIR, SEEN_FILE), "r", encoding="utf-8") as f:
+        with open(SEEN_FILE, "r", encoding="utf-8") as f:
             return set(json.load(f))
     except Exception:
         return set()
@@ -136,33 +113,28 @@ def load_seen():
 
 def save_seen(seen_set):
     try:
-        path = os.path.join(BASE_DIR, SEEN_FILE)
-        with NamedTemporaryFile("w", delete=False, dir=BASE_DIR) as tf:
-            json.dump(list(seen_set), tf, ensure_ascii=False, indent=2)
-            tmp = tf.name
-        os.replace(tmp, path)
-        logging.info(f"Saved {len(seen_set)} seen offers to {path}")
+        with open(SEEN_FILE, "w", encoding="utf-8") as f:
+            json.dump(list(seen_set), f, ensure_ascii=False, indent=2)
+        logging.info(f"Saved {len(seen_set)} seen offers to {SEEN_FILE}")
     except Exception as e:
         logging.warning(f"Failed to save seen file: {e}")
 
 
-def load_candidatures_statuses():
+def load_candidature_statuses():
     try:
-        with open(CANDIDATURES_STATUS_PATH, "r", encoding="utf-8") as f:
+        with open(CANDIDATURES_FILE, "r", encoding="utf-8") as f:
             return json.load(f)
     except Exception:
-        return {}
+        return {}  # uid -> {status: str, rank: int/None, cand_count: int/None, last_notified: iso}
 
 
-def save_candidatures_statuses(d):
+def save_candidature_statuses(data):
     try:
-        with NamedTemporaryFile("w", delete=False, dir=BASE_DIR) as tf:
-            json.dump(d, tf, ensure_ascii=False, indent=2)
-            tmp = tf.name
-        os.replace(tmp, CANDIDATURES_STATUS_PATH)
-        logging.info(f"Saved {len(d)} candidature statuses to {CANDIDATURES_STATUS_PATH}")
+        with open(CANDIDATURES_FILE, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+        logging.info(f"Saved {len(data)} candidature statuses to {CANDIDATURES_FILE}")
     except Exception as e:
-        logging.warning(f"Failed to save candidature status file: {e}")
+        logging.warning(f"Failed to save candidature statuses: {e}")
 
 
 def parse_price(price_text):
@@ -178,32 +150,24 @@ def parse_price(price_text):
         return None
 
 
-def parse_area(typ_text):
-    """
-    Extract integer m2 from typ_text like '45m2' or '45 m2' or '45m²' etc.
-    """
+def parse_area_from_typology(typ_text):
+    # expected formats: "45m2 | T2" or " 40m2 | T2"
     if not typ_text:
         return None
-    m = re.search(r"(\d{2,3})\s*m", typ_text.replace("²", "").replace("M", "m"))
-    if not m:
-        return None
-    try:
-        return int(m.group(1))
-    except:
-        return None
+    m = re.search(r"(\d{1,3})\s*m(?:2|²)?", typ_text.replace("\u00A0", " "))
+    if m:
+        try:
+            return int(m.group(1))
+        except:
+            return None
+    return None
 
 
-def normalize_status_text(s):
-    """Normalize whitespace and remove stray characters."""
-    if not s:
-        return s
-    s = s.strip()
-    s = re.sub(r"\s+", " ", s)
-    return s
-
-
-# ---------- Cookie / overlays ----------
+# ---------- UI helpers (cookies / overlays) ----------
 def handle_cookie_banner(driver, timeout=5):
+    """
+    Try to close cookie banner/popins with a list of probable selectors.
+    """
     selectors = [
         "//button[contains(., 'Accepter tous les cookies')]",
         "//button[contains(., 'Tout accepter')]",
@@ -212,50 +176,42 @@ def handle_cookie_banner(driver, timeout=5):
         "//button[contains(., 'Accept all')]",
         "//button[contains(@class,'cookie')]",
         "//a[contains(.,'Accepter')]",
-        "button.tarteaucitronAllAll"
+        "//button[contains(.,'Refuser') and contains(.,'cookies')]"  # some sites
     ]
     for s in selectors:
         try:
-            if s.startswith("//"):
-                el = WebDriverWait(driver, timeout).until(EC.element_to_be_clickable((By.XPATH, s)))
-            else:
-                el = WebDriverWait(driver, timeout).until(EC.element_to_be_clickable((By.CSS_SELECTOR, s)))
+            el = WebDriverWait(driver, timeout).until(EC.element_to_be_clickable((By.XPATH, s)))
             try:
                 el.click()
             except Exception:
                 driver.execute_script("arguments[0].click();", el)
             logging.info("✅ Bannière cookies acceptée automatiquement.")
             return True
-        except TimeoutException:
-            continue
         except Exception:
             continue
-    logging.debug("ℹ️ Pas de bannière cookies détectée ou impossibilité de la fermer automatiquement.")
+    logging.debug("No cookie banner detected or couldn't close it.")
     return False
 
 
 def close_overlays(driver):
-    candidates = [
-        "//button[contains(@class,'close') or contains(.,'Fermer') or contains(.,'Close')]",
-        "//button[contains(@aria-label,'Close')]",
-        "//div[contains(@class,'overlay')]//button",
-        "//button[contains(.,'Refuser') or contains(.,'Refuser tous les cookies')]",
-    ]
-    for sel in candidates:
-        try:
-            els = driver.find_elements(By.XPATH, sel)
-            for el in els:
-                try:
-                    if el.is_displayed():
-                        driver.execute_script("arguments[0].click();", el)
-                        time.sleep(0.2)
-                except Exception:
-                    continue
-        except Exception:
-            continue
+    """
+    Try to close typical overlays / modals to avoid click interception.
+    """
+    try:
+        # try generic close buttons
+        candidates = driver.find_elements(By.XPATH, "//button[contains(@class,'close') or contains(.,'Fermer') or contains(.,'Close') or contains(.,'Non') or contains(.,'Annuler')]")
+        for el in candidates:
+            try:
+                if el.is_displayed():
+                    driver.execute_script("arguments[0].click();", el)
+                    time.sleep(0.15)
+            except Exception:
+                continue
+    except Exception:
+        pass
 
 
-# ---------- Offer list helpers ----------
+# ---------- Offer UI helpers ----------
 def find_section_button(driver, name):
     xpath = f"//div[contains(@class,'offer-sections')]//div[contains(normalize-space(.),'{name}')]"
     try:
@@ -271,6 +227,7 @@ def get_offer_cards_in_current_section(driver):
         )
     except TimeoutException:
         return []
+    # support both app-offer-card and direct containers
     cards = container.find_elements(By.CSS_SELECTOR, "app-offer-card, .offer-card-container")
     normalized = []
     for c in cards:
@@ -284,23 +241,6 @@ def get_offer_cards_in_current_section(driver):
         except Exception:
             normalized.append(c)
     return normalized
-
-
-def click_element(driver, el):
-    try:
-        driver.execute_script("arguments[0].scrollIntoView({block: 'center'});", el)
-    except Exception:
-        pass
-    try:
-        el.click()
-        return True
-    except Exception:
-        try:
-            driver.execute_script("arguments[0].click();", el)
-            return True
-        except Exception as e:
-            logging.debug(f"JS click failed: {e}")
-            return False
 
 
 def extract_offer_info(card):
@@ -321,13 +261,13 @@ def extract_offer_info(card):
         loc = card.find_element(By.CSS_SELECTOR, ".location").text.strip()
     except Exception:
         loc = ""
+    area = parse_area_from_typology(typ)
     uid = img_src or f"{loc}|{price_text}|{typ}"
     price = parse_price(price_text)
-    area = parse_area(typ)
     return {"uid": uid, "img_src": img_src, "price_text": price_text, "price": price, "typ": typ, "loc": loc, "area": area}
 
 
-# ---------- Scrolling utilities ----------
+# ---------- scrolling utilities ----------
 def progressive_scroll_container_to_bottom(driver, container, max_attempts=CONTAINER_SCROLL_ATTEMPTS, pause=SCROLL_PAUSE):
     prev_counts = []
     attempt = 0
@@ -420,6 +360,8 @@ def is_logged_in(driver):
         driver.find_element(By.CSS_SELECTOR, ".offer-sections")
         return True
     except Exception:
+        # sometimes the logged-in landing page is 'Mes candidatures' or another dashboard
+        # check for presence of Mon compte / Mes candidatures etc.
         try:
             driver.find_element(By.XPATH, "//*[contains(text(),'Mes candidatures') or contains(text(),'Mon compte') or contains(text(),'Bienvenue')]")
             return True
@@ -445,7 +387,7 @@ def perform_login(driver, wait):
         pwd_input.clear()
         pwd_input.send_keys(PASSWORD)
 
-        # Try robust login button selectors
+        # Try robust set of login button selectors
         btn_selectors = [
             (By.CSS_SELECTOR, "button.btnCreate"),
             (By.XPATH, "//button[contains(.,'Je me connecte') or contains(.,'JE ME CONNECTE') or contains(.,'Se connecter')]"),
@@ -462,8 +404,6 @@ def perform_login(driver, wait):
                     driver.execute_script("arguments[0].click();", btn)
                 clicked = True
                 break
-            except TimeoutException:
-                continue
             except Exception:
                 continue
         if not clicked:
@@ -477,7 +417,7 @@ def perform_login(driver, wait):
         except Exception:
             pass
 
-        # Wait for offers page or 'Les offres' / 'Mes candidatures' link to be present
+        # Wait for presence of offers or candidatures link to confirm login
         wait.until(
             EC.any_of(
                 EC.presence_of_element_located((By.CSS_SELECTOR, ".offer-sections")),
@@ -533,63 +473,75 @@ def ensure_logged_in(driver, wait):
 
 # ---------- Robust apply flow ----------
 def robust_click_apply_flow(driver, wait):
+    """
+    Attempts to click Apply button robustly, confirm, and fetch result text.
+    Returns (applied_bool, result_text_or_reason)
+    """
     close_overlays(driver)
     handle_cookie_banner(driver)
 
+    apply_selectors = [
+        (By.XPATH, "//button[contains(.,'Je postule') or contains(.,'JE POSTULE') or contains(.,'Je postuler')]"),
+        (By.CSS_SELECTOR, ".btn.btn-secondary.hi-check-round"),
+        (By.XPATH, "//button[contains(.,'Postuler') or contains(.,'Postulez')]"),
+    ]
+
     for attempt in range(1, CLICK_RETRIES + 1):
-        try:
-            apply_selectors = [
-                (By.XPATH, "//button[contains(.,'Je postule') or contains(.,'JE POSTULE') or contains(.,'Je postuler')]"),
-                (By.CSS_SELECTOR, ".btn.btn-secondary.hi-check-round"),
-                (By.XPATH, "//button[contains(.,'Postuler') or contains(.,'Postulez')]"),
-            ]
-            apply_btn = None
-            for sel in apply_selectors:
-                try:
-                    apply_btn = wait.until(EC.element_to_be_clickable(sel))
-                    if apply_btn:
-                        break
-                except Exception:
-                    continue
-            if not apply_btn:
-                logging.debug(f"Attempt {attempt}: Apply button not found yet; scrolling and retrying.")
+        apply_btn = None
+        for sel in apply_selectors:
+            try:
+                apply_btn = wait.until(EC.element_to_be_clickable(sel))
+                if apply_btn:
+                    break
+            except Exception:
+                continue
+        if not apply_btn:
+            logging.debug(f"Attempt {attempt}: Apply button not found yet; scrolling and retrying.")
+            try:
                 driver.execute_script("window.scrollTo(0, document.body.scrollHeight);")
-                time.sleep(0.4)
+                time.sleep(0.2)
                 driver.execute_script("window.scrollTo(0, 0);")
+            except Exception:
+                pass
+            time.sleep(0.6)
+            continue
+
+        # try to bring it into view & click
+        try:
+            driver.execute_script("arguments[0].scrollIntoView({block:'center'}); window.scrollBy(0,-80);", apply_btn)
+        except Exception:
+            pass
+        try:
+            apply_btn.click()
+        except ElementClickInterceptedException:
+            logging.debug("ElementClickInterceptedException on apply click; trying to close overlays and JS click.")
+            close_overlays(driver)
+            time.sleep(0.2)
+            try:
+                driver.execute_script("arguments[0].click();", apply_btn)
+            except Exception as e:
+                logging.debug(f"JS click also failed: {e}")
+                # try a small scroll and retry
+                try:
+                    driver.execute_script("window.scrollBy(0,120);")
+                    time.sleep(0.2)
+                    driver.execute_script("arguments[0].click();", apply_btn)
+                except Exception:
+                    logging.debug("apply click retries failed after interception.")
+                    # fallback to continue loop to retry later
+                    time.sleep(0.6)
+                    continue
+        except Exception as e:
+            logging.debug(f"apply normal click failed: {e}; trying JS click")
+            try:
+                driver.execute_script("arguments[0].click();", apply_btn)
+            except Exception as e2:
+                logging.debug(f"JS click failed too: {e2}")
                 time.sleep(0.6)
                 continue
 
-            try:
-                driver.execute_script("arguments[0].scrollIntoView({block:'center'}); window.scrollBy(0, -80);", apply_btn)
-            except Exception:
-                pass
-            try:
-                apply_btn.click()
-            except ElementClickInterceptedException:
-                close_overlays(driver)
-                time.sleep(0.2)
-                try:
-                    driver.execute_script("arguments[0].click();", apply_btn)
-                except Exception as e:
-                    logging.debug(f"JS click also failed: {e}")
-                    raise
-            except Exception as e:
-                try:
-                    driver.execute_script("arguments[0].click();", apply_btn)
-                except Exception:
-                    logging.debug(f"Both normal and JS clicks failed on apply: {e}")
-                    raise
-            logging.info("Clicked 'Je postule'")
-            break
-        except Exception as e:
-            logging.debug(f"Attempt {attempt} click 'Je postule' failed: {e}")
-            time.sleep(0.7)
-            try:
-                driver.execute_script("window.scrollBy(0, 120);")
-                time.sleep(0.15)
-                driver.execute_script("window.scrollBy(0, -120);")
-            except Exception:
-                pass
+        logging.info("Clicked 'Je postule'")
+        break
     else:
         logging.error("All attempts to click 'Je postule' failed.")
         return False, "apply_click_failed"
@@ -634,7 +586,211 @@ def robust_click_apply_flow(driver, wait):
         return True, "applied_but_no_text"
 
 
-# ---------- Matching & find ----------
+def click_element(driver, el):
+    try:
+        driver.execute_script("arguments[0].scrollIntoView({block: 'center'});", el)
+    except Exception:
+        pass
+    try:
+        el.click()
+        return True
+    except Exception:
+        try:
+            driver.execute_script("arguments[0].click();", el)
+            return True
+        except Exception as e:
+            logging.debug(f"JS click failed: {e}")
+            return False
+
+
+# ---------- Mes candidatures helpers ----------
+def goto_mes_candidatures(driver, wait):
+    # try several selectors
+    selectors = [
+        (By.XPATH, "//a[contains(.,'Mes candidatures')]"),
+        (By.XPATH, "//a[contains(.,'Mes candidatures') or contains(.,'Mes demandes')]"),
+        (By.XPATH, "//a[contains(.,'Mon compte')]/following::a[contains(.,'Mes candidatures')]"),
+        (By.XPATH, "//a[contains(.,'Candidatures')]")
+    ]
+    for sel in selectors:
+        try:
+            el = WebDriverWait(driver, 3).until(EC.element_to_be_clickable(sel))
+            try:
+                el.click()
+            except Exception:
+                driver.execute_script("arguments[0].click();", el)
+            # wait for candidatures list
+            try:
+                wait.until(EC.presence_of_element_located((By.CSS_SELECTOR, ".tdb-s-candidature, .tdb-s-candidature, .info-candidatures")), timeout=6)
+            except Exception:
+                pass
+            time.sleep(0.6)
+            return True
+        except Exception:
+            continue
+    # fallback: try direct URL fragment if known (some pages use #/mes-candidatures)
+    try:
+        driver.get("https://al-in.fr/#/mes-candidatures")
+        time.sleep(1.2)
+        return True
+    except Exception:
+        return False
+
+
+def scan_mes_candidatures_page(driver):
+    """
+    Parse all candidature blocks from the candidatures page and return a list of dicts:
+    {uid, title_text_snapshot, statu_text, candidatures_count (int or None), rank (int or None)}
+    """
+    results = []
+    try:
+        blocks = driver.find_elements(By.CSS_SELECTOR, ".tdb-s-candidature, .info-candidatures, .tdb-s-candidature")
+        for b in blocks:
+            try:
+                title_el = b.find_element(By.CSS_SELECTOR, ".title")
+                title_text = title_el.text.strip()
+            except Exception:
+                title_text = b.text.strip()[:200]
+            # find position/candidature count
+            candid_count = None
+            try:
+                pos_div = b.find_element(By.XPATH, ".//div[contains(@class,'text_picto_vert') or contains(.,'candidatures déposées')]")
+                candid_text = pos_div.text.strip()
+                m = re.search(r"(\d{1,4})\s+candidature", candid_text.replace("\u00A0", " "))
+                if m:
+                    candid_count = int(m.group(1))
+            except Exception:
+                # maybe there is a dedicated "Position" box
+                try:
+                    pos_div2 = b.find_element(By.XPATH, ".//*[contains(text(),'Position')]/following::*[1]")
+                    candid_text = pos_div2.text.strip()
+                    m = re.search(r"(\d{1,4})", candid_text)
+                    if m:
+                        candid_count = int(m.group(1))
+                except Exception:
+                    candid_count = None
+            # status field
+            statu = None
+            try:
+                statu_el = b.find_element(By.XPATH, ".//*[contains(.,'Statut de la demande')]/following::*[1]")
+                statu = statu_el.text.strip()
+            except Exception:
+                # fallback: look for any .data red element near "Statut"
+                try:
+                    statu_el2 = b.find_element(By.CSS_SELECTOR, ".data")
+                    statu = statu_el2.text.strip()
+                except Exception:
+                    statu = None
+            # rank: try to find if there is a "rang" or number near "Position" or similar
+            rank = None
+            try:
+                # sometimes there's text like "Vous êtes en position N"
+                txt = b.text
+                m_rank = re.search(r"position\s+(\d{1,3})", txt, re.IGNORECASE)
+                if m_rank:
+                    rank = int(m_rank.group(1))
+            except Exception:
+                pass
+
+            # derive uid: use title_text as uid key (unique enough) or image src if present
+            uid = title_text
+            try:
+                img = b.find_element(By.CSS_SELECTOR, ".offer-card-container .offer-image img")
+                uid = img.get_attribute("src") or uid
+            except Exception:
+                pass
+
+            results.append({"uid": uid, "title_snapshot": title_text, "status": statu, "cand_count": candid_count, "rank": rank})
+    except Exception:
+        # fallback: try to parse main page as text
+        try:
+            body = driver.find_element(By.TAG_NAME, "body").text
+            results.append({"uid": "page_text_snapshot", "title_snapshot": body[:800], "status": None, "cand_count": None, "rank": None})
+        except Exception:
+            pass
+    return results
+
+
+def cancel_candidature_if_not_rank1(driver, wait, uid_key):
+    """
+    On mes candidatures page, find candidature matching uid_key and if rank exists and !=1, cancel it.
+    Returns True if cancelled, False otherwise.
+    """
+    try:
+        blocks = driver.find_elements(By.CSS_SELECTOR, ".tdb-s-candidature, .info-candidatures")
+        for b in blocks:
+            try:
+                title_el = b.find_element(By.CSS_SELECTOR, ".title")
+                title_text = title_el.text.strip()
+            except Exception:
+                title_text = b.text.strip()[:200]
+            # match by uid_key presence in title or image src
+            matched = False
+            try:
+                img = b.find_element(By.CSS_SELECTOR, ".offer-image img")
+                if img and uid_key in (img.get_attribute("src") or ""):
+                    matched = True
+            except Exception:
+                pass
+            if not matched and uid_key in title_text:
+                matched = True
+            if not matched:
+                continue
+
+            # find rank
+            rank = None
+            try:
+                txt = b.text
+                m_rank = re.search(r"position\s+(\d{1,3})", txt, re.IGNORECASE)
+                if m_rank:
+                    rank = int(m_rank.group(1))
+            except Exception:
+                pass
+
+            if rank is None:
+                logging.debug("No rank found for matched candidature; will not auto-cancel.")
+                return False
+
+            if rank != 1:
+                # click cancel: look for 'Annuler cette candidature' link/button
+                try:
+                    cancel_el = b.find_element(By.XPATH, ".//a[contains(.,'Annuler') or contains(.,'Annuler cette candidature') or contains(.,'Annuler la candidature')]")
+                    try:
+                        cancel_el.click()
+                    except Exception:
+                        driver.execute_script("arguments[0].click();", cancel_el)
+                    time.sleep(0.4)
+                    # popin: click 'Oui'
+                    try:
+                        yes_btn = WebDriverWait(driver, 4).until(EC.element_to_be_clickable((By.XPATH, "//button[contains(.,'Oui') or contains(.,'Confirmer') or contains(.,'OK')]")))
+                        try:
+                            yes_btn.click()
+                        except Exception:
+                            driver.execute_script("arguments[0].click();", yes_btn)
+                        logging.info(f"Cancelled candidature for uid_key={uid_key} because rank={rank} != 1")
+                        return True
+                    except Exception:
+                        # Try to click dialog close or confirm differently
+                        try:
+                            confirm = driver.find_element(By.XPATH, "//button[contains(.,'Oui') or contains(.,'OK') or contains(.,'Confirmer')]")
+                            driver.execute_script("arguments[0].click();", confirm)
+                            logging.info(f"Cancelled candidature for uid_key={uid_key} (fallback confirmation).")
+                            return True
+                        except Exception:
+                            logging.warning("Could not confirm cancellation pop-in.")
+                            return False
+                except Exception:
+                    logging.warning("Cancel link/button not found for candidature despite rank!=1.")
+                    return False
+            else:
+                logging.info("Rank is 1 -> do not cancel.")
+                return False
+    except Exception:
+        pass
+    return False
+
+
+# ---------- Finding matching offers ----------
 def find_matching_offers_in_section(driver, wait, seen, section_name):
     found = []
     btn = find_section_button(driver, section_name)
@@ -645,7 +801,7 @@ def find_matching_offers_in_section(driver, wait, seen, section_name):
     time.sleep(0.6)
     try:
         container = wait.until(EC.presence_of_element_located((By.CSS_SELECTOR, ".offer-list-container")))
-        progressive_scroll_container_to_bottom(driver, container)
+        progressive_scroll_container_to_bottom(driver, container, max_attempts=8, pause=0.4)  # smaller efforts for speed
     except Exception:
         pass
     time.sleep(0.3)
@@ -662,295 +818,26 @@ def find_matching_offers_in_section(driver, wait, seen, section_name):
             continue
         if info.get("price") > MAX_PRICE:
             continue
-        # enforce minimum area
+        # area check
         area = info.get("area")
-        if area is None or area < MIN_AREA_M2:
+        if area is None or area < MIN_AREA:
             continue
         found.append((card, info))
     return found
 
 
-# ---------- Candidature monitoring ----------
-def extract_candidature_info(cand_elem):
-    """
-    From a candidature element, extract a uid and current status text and (attempt) rank.
-    Return dict with keys: uid, header_text, status_text, rank (int or None), full_text
-    """
-    text = cand_elem.text or ""
-    # header/title
-    header_text = ""
-    try:
-        header = cand_elem.find_element(By.CSS_SELECTOR, ".title")
-        header_text = header.text.strip()
-    except Exception:
-        lines = [l.strip() for l in text.splitlines() if l.strip()]
-        header_text = lines[0] if lines else ""
-
-    # 1) Prefer step-based active/current step title (e.g., "Je postule", "Validations")
-    status_text = None
-    try:
-        # pick the first step-title that has a 'current' or 'active' ancestor
-        step_nodes = cand_elem.find_elements(By.XPATH, ".//div[contains(@class,'steps')]//div[contains(@class,'a-step')]//div[contains(@class,'step-title')]")
-        for s in step_nodes:
-            stext = s.text.strip()
-            if not stext:
-                continue
-            # filter out date-like strings
-            if re.match(r"\d{1,2}/\d{1,2}/\d{2,4}", stext):
-                continue
-            status_text = stext
-            # prefer ones that have 'current' or 'active' in ancestor class
-            try:
-                parent = s.find_element(By.XPATH, "..")
-                cls = parent.get_attribute("class") or ""
-                if "current" in cls or "active" in cls:
-                    status_text = stext
-                    break
-            except Exception:
-                break
-    except Exception:
-        pass
-
-    # 2) If not found, search for "Statut de la demande" label and pick the following line (strict)
-    if not status_text:
-        try:
-            # find nearby span that doesn't look like a date/number/candidate-count
-            label_nodes = cand_elem.find_elements(By.XPATH, ".//*[contains(normalize-space(.),'Statut de la demande')]")
-            for label in label_nodes:
-                try:
-                    parent = label.find_element(By.XPATH, "..")
-                    # look for .data or .text elements under parent
-                    candidates = parent.find_elements(By.XPATH, ".//span | .//div")
-                    for c in candidates:
-                        stext = c.text.strip()
-                        if not stext:
-                            continue
-                        # avoid picking date or counts (e.g., 'Il y a actuellement 221 candidatures...')
-                        if re.match(r"\d{1,2}/\d{1,2}/\d{2,4}", stext):
-                            continue
-                        if re.search(r"candidat|candidature|candidatures", stext, re.IGNORECASE):
-                            continue
-                        # safe
-                        status_text = stext
-                        break
-                    if status_text:
-                        break
-                except Exception:
-                    continue
-        except Exception:
-            pass
-
-    # 3) Another fallback: pick .data.red but avoid dates and counts
-    if not status_text:
-        try:
-            data_spans = cand_elem.find_elements(By.CSS_SELECTOR, ".data, .data.red, .text_picto_vert")
-            for s in data_spans:
-                st = s.text.strip()
-                if not st:
-                    continue
-                # filter out known unwanted patterns
-                if "candidat" in st.lower() or "candidatures" in st.lower():
-                    continue
-                if re.match(r"\d{1,2}/\d{1,2}/\d{2,4}", st):
-                    continue
-                if re.match(r"^\d+$", st):
-                    continue
-                status_text = st
-                break
-        except Exception:
-            pass
-
-    # last fallback: scan visible lines but avoid dates and counts
-    if not status_text:
-        lines = [l.strip() for l in text.splitlines() if l.strip()]
-        for line in lines:
-            if re.match(r"\d{1,2}/\d{1,2}/\d{2,4}", line):
-                continue
-            if re.search(r"candidat|candidature|candidatures", line, re.IGNORECASE):
-                continue
-            if len(line) < 3:
-                continue
-            status_text = line
-            break
-
-    if not status_text:
-        status_text = "Unknown"
-
-    # normalize
-    status_text = normalize_status_text(status_text)
-
-    # attempt to parse rank (search in text for 'Position' or 'position' and a number)
-    rank = None
-    try:
-        m = re.search(r"Position\s*\n?\s*[:\-]?\s*(\d{1,4})", text, re.IGNORECASE)
-        if not m:
-            m = re.search(r"position[^\d]*(\d{1,4})", text, re.IGNORECASE)
-        if m:
-            rank = int(m.group(1))
-    except Exception:
-        rank = None
-
-    uid = header_text or (text.splitlines()[0] if text else str(hash(text)))
-    return {"uid": uid, "header": header_text, "status": status_text, "rank": rank, "full_text": text}
-
-
-def process_candidatures_and_notify(driver, wait, candid_statuses, send_notifications=True, send_on_first_run=False):
-    """
-    Navigate to 'Mes candidatures' and read current candidatures.
-    For each candidature, if status differs from saved status, send email (once) and update saved map.
-    Deduplicates by uid within the run so you don't get multiple emails.
-    Behavior:
-      - If send_notifications == False -> do not send any emails, just return the map
-      - If send_notifications == True:
-          - send an email only when previous status exists and prev != current
-          - or when prev is None AND send_on_first_run == True
-    """
-    # Navigate to 'Mes candidatures' page if possible
-    try:
-        try:
-            mc = driver.find_element(By.XPATH, "//a[contains(.,'Mes candidatures') or contains(.,'Mes candidatures')]")
-            try:
-                click_element(driver, mc)
-            except Exception:
-                try:
-                    driver.execute_script("arguments[0].click();", mc)
-                except Exception:
-                    pass
-        except Exception:
-            try:
-                driver.get("https://al-in.fr/#/mes-candidatures")
-            except Exception:
-                pass
-        time.sleep(1)
-    except Exception:
-        pass
-
-    time.sleep(0.6)
-    close_overlays(driver)
-    handle_cookie_banner(driver)
-
-    # gather candidature elements
-    cand_elems = []
-    try:
-        cand_elems = driver.find_elements(By.CSS_SELECTOR, ".tdb-s-candidature, .info-candidatures")
-    except Exception:
-        cand_elems = []
-
-    if not cand_elems:
-        try:
-            cand_elems = driver.find_elements(By.CSS_SELECTOR, ".tdb-s-candidature")
-        except Exception:
-            cand_elems = []
-
-    current_map = dict(candid_statuses)
-    processed_uids = set()
-    sent_in_run = set()
-    changed_items = []
-
-    for elem in cand_elems:
-        try:
-            info = extract_candidature_info(elem)
-            uid = info["uid"]
-            if uid in processed_uids:
-                continue
-            processed_uids.add(uid)
-
-            status = info["status"]
-            rank = info.get("rank")
-            prev = candid_statuses.get(uid)
-
-            # Do not treat date-like statuses as real status change:
-            if re.match(r"\d{1,2}/\d{1,2}/\d{2,4}$", status):
-                # likely a date (date-limit), ignore as status; fall back to Unknown
-                logging.debug(f"Ignoring date-like status for uid={uid}: {status}")
-                status = "Unknown"
-
-            should_send = False
-            if send_notifications:
-                if prev is not None:
-                    if prev != status:
-                        should_send = True
-                else:
-                    # prev is None
-                    if send_on_first_run:
-                        should_send = True
-
-            if should_send and uid not in sent_in_run:
-                subject = f"BOTALIN - Candidature statut mis à jour: {status}"
-                body_lines = [
-                    f"Candidature: {info['header'] or uid}",
-                    "",
-                    "Element text snapshot:",
-                    info["full_text"],
-                    "",
-                    f"Nouveau statut: {status}",
-                    f"Ancien statut: {prev}",
-                ]
-                body = "\n".join(body_lines)
-                ok = send_email(subject, body)
-                if ok:
-                    logging.info(f"Sent candidature status change email for uid={uid} status={status}")
-                else:
-                    logging.warning(f"Failed sending candidature status email for uid={uid}")
-                current_map[uid] = status
-                changed_items.append((uid, prev, status, rank))
-                sent_in_run.add(uid)
-            else:
-                # persist new candidatures (so no repeated None->status emails unless send_on_first_run True)
-                if prev is None:
-                    current_map[uid] = status
-        except Exception as e:
-            logging.debug(f"Failed to process candidature element: {e}")
-            continue
-
-    if changed_items:
-        save_candidatures_statuses(current_map)
-
-    if not candid_statuses and current_map:
-        # first run: persist initial states (and only send email if explicit env var enabled)
-        save_candidatures_statuses(current_map)
-
-    return current_map, changed_items
-
-
-# ---------- Cancel candidature flow ----------
-def cancel_candidature_by_element(driver, wait, cand_elem):
-    """
-    Click the 'Annuler cette candidature' link inside cand_elem and confirm the dialog.
-    Return True if appears cancelled (best-effort).
-    """
-    try:
-        try:
-            cancel_link = cand_elem.find_element(By.XPATH, ".//a[contains(.,'Annuler') or contains(.,'Annuler cette candidature')]")
-        except Exception:
-            cancel_link = cand_elem.find_element(By.CSS_SELECTOR, "a.tool-link.hi-cross-round")
-        click_element(driver, cancel_link)
-        time.sleep(0.4)
-        try:
-            yes_btn = WebDriverWait(driver, 6).until(EC.element_to_be_clickable((By.XPATH, "//button[normalize-space(.)='Oui' or contains(.,'Oui')]")))
-            try:
-                yes_btn.click()
-            except Exception:
-                driver.execute_script("arguments[0].click();", yes_btn)
-            time.sleep(0.6)
-            logging.info("Clicked confirmation 'Oui' for cancellation.")
-            return True
-        except Exception:
-            logging.warning("Confirmation dialog not found for cancellation.")
-            return False
-    except Exception as e:
-        logging.warning(f"Failed to cancel candidature: {e}")
-        return False
-
-
 # ---------- Main ----------
 def main():
     logging.info("Starting bot")
+    # Load persistent data
     seen = load_seen()
-    candid_statuses = load_candidatures_statuses()
-    initial_scan = (len(candid_statuses) == 0)
+    candidatures = load_candidature_statuses()
     logging.info(f"Loaded {len(seen)} seen offers (from {SEEN_FILE} if present)")
-    logging.info(f"Loaded {len(candid_statuses)} saved candidature statuses (from {CANDIDATURES_STATUS_PATH} if present). initial_scan={initial_scan}")
+    logging.info(f"Loaded {len(candidatures)} saved candidature statuses (from {CANDIDATURES_FILE} if present)")
+
+    # Window guard: operate during certain hours? (not enforced here, but you can add)
+    start_time = datetime.utcnow()
+    end_time = start_time + timedelta(seconds=MAX_RUN_SECONDS)
 
     try:
         driver = init_driver()
@@ -966,6 +853,11 @@ def main():
             send_email("BOTALIN - Login failed", "The bot could not log in with provided credentials.")
             return
 
+        # Ensure cookies/overlays closed and we're on offers page
+        handle_cookie_banner(driver)
+        close_overlays(driver)
+        time.sleep(0.4)
+
         sections_priority = [
             "Communes demandées",
             "Communes limitrophes",
@@ -975,94 +867,122 @@ def main():
         selected_card = None
         selected_info = None
 
-        # check Communes demandées first, then others
-        matches = find_matching_offers_in_section(driver, wait, seen, "Communes demandées")
-        if matches:
-            selected_card, selected_info = matches[0]
-            logging.info("Selected first matching offer in 'Communes demandées'")
-        else:
-            for sect in ("Communes limitrophes", "Autres communes du département"):
-                matches = find_matching_offers_in_section(driver, wait, seen, sect)
-                if matches:
-                    selected_card, selected_info = matches[0]
-                    logging.info(f"Selected first matching offer in '{sect}'")
-                    break
+        # first check priority sections for matches
+        for sect in sections_priority:
+            matches = find_matching_offers_in_section(driver, wait, seen, sect)
+            if matches:
+                selected_card, selected_info = matches[0]
+                logging.info(f"Selected first matching offer in '{sect}'")
+                break
 
-        applied_uid = None
-        if selected_card:
-            info = selected_info
-            uid = info["uid"]
-            logging.info(f"Applying to selected offer: {info}")
+        if not selected_card:
+            logging.info("No matching new offers found during this run.")
+            return
 
-            # open detail
-            try:
-                try:
-                    img_el = selected_card.find_element(By.CSS_SELECTOR, ".offer-image img")
-                    click_element(driver, img_el)
-                except Exception:
-                    click_element(driver, selected_card)
-            except Exception as e:
-                logging.warning(f"Could not open offer detail: {e}")
-                send_email("BOTALIN - Open offer failed", f"Failed to open offer detail: {info}\nException: {e}")
-                seen.add(uid)
-                save_seen(seen)
-                selected_card = None
+        info = selected_info
+        uid = info["uid"]
+        logging.info(f"Applying to selected offer: {info}")
 
-            if selected_card:
-                applied, result = robust_click_apply_flow(driver, wait)
-                if applied:
-                    applied_uid = uid
-                    seen.add(uid)
-                    save_seen(seen)
-                    subject = f"BOTALIN - Applied to offer ({info['loc']})"
-                    body = f"Applied to: {info}\nResult: {result}"
-                    ok_email = send_email(subject, body)
-                    if not ok_email:
-                        logging.warning("Email notification failed; check SMTP credentials or use App Password.")
-                    logging.info("Applied (or attempted) and processed notification.")
-                else:
-                    logging.error(f"Failed to click apply for offer: {info}")
-                    send_email("BOTALIN - Apply click failed", f"Failed to click apply button for offer: {info}")
-                    seen.add(uid)
-                    save_seen(seen)
-
-        # --- After apply (or even if nothing applied), check 'Mes candidatures' and notify only if status changed ---
+        # open detail
         try:
-            # if initial scan, do not send notifications unless SEND_ON_FIRST_RUN True
-            updated_statuses, changes = process_candidatures_and_notify(driver, wait, candid_statuses, send_notifications=not initial_scan, send_on_first_run=SEND_ON_FIRST_RUN)
-            candid_statuses = updated_statuses
-            if changes:
-                logging.info(f"Candidature status changes detected: {changes}")
-        except Exception as e:
-            logging.warning(f"Failed to process candidatures: {e}")
-
-        # If we just applied and cancel-if-rank-not-one is desired, attempt to find the new candidature and cancel if rank != 1
-        if applied_uid:
-            time.sleep(1)
             try:
-                cand_elems = driver.find_elements(By.CSS_SELECTOR, ".tdb-s-candidature, .info-candidatures")
-                for elem in cand_elems:
-                    try:
-                        info = extract_candidature_info(elem)
-                        if info["uid"] == applied_uid or (applied_uid in info.get("full_text", "")):
-                            rank = info.get("rank")
-                            logging.info(f"Applied candidature found with rank={rank}")
-                            if rank is not None and rank != 1:
-                                ok_cancel = cancel_candidature_by_element(driver, wait, elem)
-                                if ok_cancel:
-                                    logging.info("Cancelled candidature because rank != 1")
-                                    send_email("BOTALIN - Candidature cancelled", f"Cancelled candidature for {info['header']} because rank={rank} != 1")
-                                    candid_statuses[applied_uid] = "Cancelled_by_bot"
-                                    save_candidatures_statuses(candid_statuses)
-                                else:
-                                    logging.warning("Attempt to cancel candidature failed.")
-                            break
-                    except Exception:
-                        continue
-            except Exception as e:
-                logging.debug(f"Error while searching for applied candidature to possibly cancel: {e}")
+                img_el = selected_card.find_element(By.CSS_SELECTOR, ".offer-image img")
+                click_element(driver, img_el)
+            except Exception:
+                click_element(driver, selected_card)
+            time.sleep(0.6)
+        except Exception as e:
+            logging.warning(f"Could not open offer detail: {e}")
+            send_email("BOTALIN - Open offer failed", f"Failed to open offer detail: {info}\nException: {e}")
+            seen.add(uid)
+            save_seen(seen)
+            return
 
-        logging.info("Bot finished run.")
+        # attempt apply
+        applied, result = robust_click_apply_flow(driver, wait)
+        logging.info(f"Apply action returned: applied={applied}, result={result}")
+
+        # if applied but no text, check Mes candidatures to confirm
+        if applied and result == "applied_but_no_text":
+            logging.info("No confirmation text after apply; checking 'Mes candidatures' to confirm deposit.")
+            if goto_mes_candidatures(driver, wait):
+                cand_list = scan_mes_candidatures_page(driver)
+                # try to find entry by uid or by title containing loc+price
+                matched_cand = None
+                for c in cand_list:
+                    if info['uid'] in (c.get("uid") or "") or (info['loc'] in (c.get("title_snapshot") or "") and str(info['price']) in (c.get("title_snapshot") or "")):
+                        matched_cand = c
+                        break
+                if matched_cand:
+                    result = matched_cand.get("status") or "applied_but_no_status"
+                    # get rank and cand_count
+                    rank = matched_cand.get("rank")
+                    cand_count = matched_cand.get("cand_count")
+                    logging.info(f"Found candidature on Mes candidatures: status={result}, rank={rank}, cand_count={cand_count}")
+                    # if rank exists and !=1, cancel candidature
+                    if rank is not None and rank != 1:
+                        cancelled = cancel_candidature_if_not_rank1(driver, wait, matched_cand.get("uid") or matched_cand.get("title_snapshot"))
+                        if cancelled:
+                            logging.info("Candidature cancelled because rank != 1")
+                            # mark as seen and return (no notification about successful apply)
+                            seen.add(uid)
+                            save_seen(seen)
+                            return
+                else:
+                    logging.info("Could not find matching candidature in 'Mes candidatures' after applying.")
+            else:
+                logging.debug("Could not navigate to 'Mes candidatures' to check application.")
+
+        # Post-process applied or apply failure
+        if applied:
+            # Add to seen and save
+            seen.add(uid)
+            save_seen(seen)
+
+            # after application go to "Mes candidatures" and update statuses to send notifications only on change
+            if goto_mes_candidatures(driver, wait):
+                cand_list2 = scan_mes_candidatures_page(driver)
+                # find the one matching
+                matched = None
+                for c in cand_list2:
+                    if info['uid'] in (c.get("uid") or "") or (info['loc'] in (c.get("title_snapshot") or "") and str(info['price']) in (c.get("title_snapshot") or "")):
+                        matched = c
+                        break
+
+                if matched:
+                    uid_key = matched.get("uid") or matched.get("title_snapshot")
+                    new_status = matched.get("status")
+                    cand_count = matched.get("cand_count")
+                    rank = matched.get("rank")
+                    # fetch old entry
+                    old = candidatures.get(uid_key)
+                    old_status = old.get("status") if old else None
+                    # Only send email if status changed (not None -> new value differs)
+                    if new_status != old_status:
+                        # update stored
+                        candidatures[uid_key] = {"status": new_status, "rank": rank, "cand_count": cand_count, "last_notified": datetime.utcnow().isoformat()}
+                        save_candidature_statuses(candidatures)
+                        subject = f"BOTALIN - Candidature statut mis à jour: {new_status or 'unknown'}"
+                        body = f"Candidature: {matched.get('title_snapshot')}\n\nElement text snapshot:\n{matched.get('title_snapshot')}\n\nNouveau statut: {new_status}\nAncien statut: {old_status}\nRang: {rank}\nNombre de candidatures: {cand_count}"
+                        ok = send_email(subject, body)
+                        if ok:
+                            logging.info(f"Sent candidature status change email for uid={uid_key} status={new_status}")
+                        else:
+                            logging.warning("Failed to send candidature status change email.")
+                    else:
+                        logging.info("No change in candidature status -> no notification.")
+                else:
+                    logging.info("Applied but no candidature found in 'Mes candidatures' to update statuses.")
+            else:
+                logging.debug("Could not navigate to 'Mes candidatures' after applying.")
+            logging.info("Applied (or attempted) and processed notification.")
+        else:
+            # apply failed entirely
+            seen.add(uid)
+            save_seen(seen)
+            logging.error(f"Failed to apply for offer: {info}. Reason: {result}")
+            send_email("BOTALIN - Apply click failed", f"Failed to click apply for offer: {info}\nReason: {result}")
+
     except Exception as e:
         try:
             driver.save_screenshot("unhandled_error.png")
