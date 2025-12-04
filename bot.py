@@ -33,22 +33,22 @@ WAIT_TIMEOUT = int(os.environ.get("WAIT_TIMEOUT", "12"))
 HEADLESS = os.environ.get("HEADLESS", "true").lower() in ("1", "true", "yes")
 MAX_RUN_SECONDS = int(os.environ.get("MAX_RUN_SECONDS", "300"))
 
-# SMTP notification config (use environment variables)
-SENDER_EMAIL = os.environ.get("SENDER_EMAIL", "tesstedsgstsredr@gmail.com")   # example: tesstedsgstsredr@gmail.com
-SENDER_PASS = os.environ.get("SENDER_PASS", "usdd czjy zsnq iael")     # app password for Gmail (recommended)
-RECIPIENT_EMAIL = os.environ.get("RECIPIENT_EMAIL", "fennane.mohamedamine@gmail.com")  # your mailbox to receive notifications
+# SMTP notification config
+SENDER_EMAIL = os.environ.get("SENDER_EMAIL", "tesstedsgstsredr@gmail.com")
+SENDER_PASS = os.environ.get("SENDER_PASS", "usdd czjy zsnq iael")
+# UPDATED: Added second email recipient
+RECIPIENT_EMAIL = os.environ.get("RECIPIENT_EMAIL", "fennane.mohamedamine@gmail.com, abdelhakim.fennane@sncf.fr")
 
 # ---------- ACCOUNT DEFINITIONS ----------
-# Two accounts: account1 = main, account2 = secondary
 ACCOUNTS = [
     {
         "name": "account1",
         "email_env": "mohamed-amine.fennane@epita.fr",
         "pass_env": "&9.Mnq.6F8'M/wm{",
-        "max_price": 800,                           # UPDATED: Max 800€
-        "min_area": 45,                             # UPDATED: Min 45m2
-        "wanted_typ": "T2",                         # UPDATED: T2 only
-        "section_scope": ["Communes demandées"],    # UPDATED: Only Communes demandées
+        "max_price": 800,                           # Max 800€
+        "min_area": 45,                             # Min 45m2
+        "wanted_typ": "T2",                         # T2 only
+        "section_scope": ["Communes demandées"],    # Only Communes demandées
         "seen_file": "offers_seen_account1.json",
         "cand_file": "candidatures_status_account1.json",
     },
@@ -56,10 +56,10 @@ ACCOUNTS = [
         "name": "account2",
         "email_env": "abdelhakim.fennane@sncf.fr",
         "pass_env": "Youssef2017*@",
-        "max_price": 900,                           # UPDATED: Max 900€
-        "min_area": 0,                              # No specific min area requested for T4/T5
-        "wanted_typ": "T4|T5",                      # UPDATED: T4 or T5
-        "section_scope": ["Communes demandées"],    # UPDATED: Only Communes demandées
+        "max_price": 900,                           # Max 900€
+        "min_area": 0,                              # No specific min area
+        "wanted_typ": "T4|T5",                      # T4 or T5
+        "section_scope": ["Communes demandées"],    # Only Communes demandées
         "seen_file": "offers_seen_account2.json",
         "cand_file": "candidatures_status_account2.json",
     }
@@ -89,7 +89,7 @@ def send_email(subject: str, body: str) -> bool:
             s.starttls()
             s.login(SENDER_EMAIL, SENDER_PASS)
             s.send_message(msg)
-        logging.info("Notification email sent via smtp.gmail.com:587")
+        logging.info(f"Notification email sent to {RECIPIENT_EMAIL} via smtp.gmail.com:587")
         return True
     except smtplib.SMTPAuthenticationError as e:
         logging.warning(f"SMTP auth failed (TLS): {e}")
@@ -100,7 +100,7 @@ def send_email(subject: str, body: str) -> bool:
         with smtplib.SMTP_SSL("smtp.gmail.com", 465, timeout=20) as s:
             s.login(SENDER_EMAIL, SENDER_PASS)
             s.send_message(msg)
-        logging.info("Notification email sent via smtp.gmail.com:465")
+        logging.info(f"Notification email sent to {RECIPIENT_EMAIL} via smtp.gmail.com:465")
         return True
     except Exception as e:
         logging.warning(f"SMTP SSL send failed: {e}")
@@ -674,10 +674,10 @@ def find_matching_offers_in_section(driver, wait, seen, section_name, criteria):
 
 def process_account(account):
     # read account credentials from env
-    email = os.environ.get(account["email_env"])  # EMAIL_1 or EMAIL_2
-    password = os.environ.get(account["pass_env"])  # PASSWORD_1 or PASSWORD_2
+    email = os.environ.get(account["email_env"])
+    password = os.environ.get(account["pass_env"])
     if not email or not password:
-        logging.error(f"Credentials for {account['name']} not provided in env vars {account['email_env']}/{account['pass_env']}. Skipping.")
+        logging.error(f"Credentials for {account['name']} not provided in env vars. Skipping.")
         return
 
     seen = set(load_json(account["seen_file"], []))
@@ -748,7 +748,7 @@ def process_account(account):
                 if matched_cand:
                     result = matched_cand.get("status") or result
                     rank = matched_cand.get("rank")
-                    cand_count = matched_cand.get("cand_count")
+                    
                     # cancellation rule
                     if rank is not None and rank > 10:
                         cancelled = cancel_candidature_if_rank_too_high(driver, wait, matched_cand.get("uid") or matched_cand.get("title_snapshot"))
@@ -814,7 +814,6 @@ def process_account(account):
 # ---------- ENTRY POINT ----------
 
 def main():
-    # Run account1 then account2 sequentially (user requested)
     for account in ACCOUNTS:
         process_account(account)
 
