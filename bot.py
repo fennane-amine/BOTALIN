@@ -57,7 +57,7 @@ ACCOUNTS = [
         "email_env": "abdelhakim.fennane@sncf.fr",
         "pass_env": "Youssef2017*@",
         "max_price": 900,                           # UPDATED: Max 900€
-        "min_area": 0,                              # No specific min area requested for T4/T5, kept 0 to be safe
+        "min_area": 0,                              # No specific min area requested for T4/T5
         "wanted_typ": "T4|T5",                      # UPDATED: T4 or T5
         "section_scope": ["Communes demandées"],    # UPDATED: Only Communes demandées
         "seen_file": "offers_seen_account2.json",
@@ -739,4 +739,84 @@ def process_account(account):
         # If applied but no confirmation text, check mes candidatures
         if applied and result == "applied_but_no_text":
             if goto_mes_candidatures(driver, wait):
-                cand_list = scan
+                cand_list = scan_mes_candidatures_page(driver)
+                matched_cand = None
+                for c in cand_list:
+                    if info['uid'] in (c.get("uid") or "") or (info['loc'] in (c.get("title_snapshot") or "") and str(info['price']) in (c.get("title_snapshot") or "")):
+                        matched_cand = c
+                        break
+                if matched_cand:
+                    result = matched_cand.get("status") or result
+                    rank = matched_cand.get("rank")
+                    cand_count = matched_cand.get("cand_count")
+                    # cancellation rule
+                    if rank is not None and rank > 10:
+                        cancelled = cancel_candidature_if_rank_too_high(driver, wait, matched_cand.get("uid") or matched_cand.get("title_snapshot"))
+                        if cancelled:
+                            seen.add(uid)
+                            save_json(account["seen_file"], list(seen))
+                            driver.quit()
+                            return
+
+        # Post-process
+        if applied:
+            seen.add(uid)
+            save_json(account["seen_file"], list(seen))
+
+            # update candidatures statuses and notify only on change
+            if goto_mes_candidatures(driver, wait):
+                cand_list2 = scan_mes_candidatures_page(driver)
+                matched = None
+                for c in cand_list2:
+                    if info['uid'] in (c.get("uid") or "") or (info['loc'] in (c.get("title_snapshot") or "") and str(info['price']) in (c.get("title_snapshot") or "")):
+                        matched = c
+                        break
+                if matched:
+                    uid_key = matched.get("uid") or matched.get("title_snapshot")
+                    new_status = matched.get("status")
+                    cand_count = matched.get("cand_count")
+                    rank = matched.get("rank")
+                    old = candidatures.get(uid_key)
+                    old_status = old.get("status") if old else None
+                    if new_status != old_status:
+                        # store and notify once
+                        candidatures[uid_key] = {"status": new_status, "rank": rank, "cand_count": cand_count, "last_notified": datetime.utcnow().isoformat()}
+                        save_json(account["cand_file"], candidatures)
+                        subject = f"BOTALIN - Candidature statut mis à jour ({account['name']}): {new_status or 'unknown'}"
+                        body = f"Candidature: {matched.get('title_snapshot')}\n\nText snapshot:\n{matched.get('raw_text')}\n\nNouveau statut: {new_status}\nAncien statut: {old_status}\nRang: {rank}\nNombre de candidatures: {cand_count}"
+                        send_email(subject, body)
+                        logging.info(f"[{account['name']}] Sent candidature status change email for uid={uid_key} status={new_status}")
+                    else:
+                        logging.info(f"[{account['name']}] No change in candidature status -> no notification.")
+                else:
+                    logging.info(f"[{account['name']}] Applied but no matching candidature found in 'Mes candidatures'.")
+            else:
+                logging.debug(f"[{account['name']}] Could not navigate to 'Mes candidatures' after applying.")
+        else:
+            seen.add(uid)
+            save_json(account["seen_file"], list(seen))
+            logging.error(f"[{account['name']}] Apply failed: {result}")
+            send_email(f"BOTALIN - Apply click failed ({account['name']})", f"Failed to apply for offer: {info}\nReason: {result}")
+
+    except Exception as e:
+        try:
+            driver.save_screenshot(f"unhandled_{account['name']}.png")
+        except:
+            pass
+        logging.error(f"[{account['name']}] Unhandled exception: {e}")
+        send_email(f"BOTALIN - Unhandled error ({account['name']})", f"Unhandled exception: {e}")
+    finally:
+        try:
+            driver.quit()
+        except:
+            pass
+
+# ---------- ENTRY POINT ----------
+
+def main():
+    # Run account1 then account2 sequentially (user requested)
+    for account in ACCOUNTS:
+        process_account(account)
+
+if __name__ == "__main__":
+    main()
