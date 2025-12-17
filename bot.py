@@ -139,7 +139,7 @@ def parse_area_from_typology(typ_text: str):
 def handle_cookie_banner(driver, timeout=5):
     # Updated selectors based on provided HTML
     selectors = [
-        "button[data-cookiefirst-action='accept']",  # Robust selector from your HTML
+        "button[data-cookiefirst-action='accept']",
         "//button[contains(., 'Accepter tous les cookies')]",
         "//button[contains(@class, 'cf2Lf6') and contains(., 'Accepter')]",
     ]
@@ -239,18 +239,19 @@ def perform_login(driver, wait, email, password):
         except:
             driver.execute_script("arguments[0].click();", btn)
             
-        logging.info("Clicked login button. Waiting for dashboard...")
+        logging.info("Clicked login button. Waiting for dashboard or candidature page...")
 
-        # Wait longer for dashboard (up to 30s)
+        # Wait longer for dashboard or candidature page
         WebDriverWait(driver, 30).until(EC.any_of(
-             EC.presence_of_element_located((By.CSS_SELECTOR, ".offer-sections")),
+             EC.presence_of_element_located((By.CSS_SELECTOR, ".offer-sections")),      # Offres
+             EC.presence_of_element_located((By.CSS_SELECTOR, ".tdb-s-candidature")),  # Candidatures (redirected here)
              EC.presence_of_element_located((By.CSS_SELECTOR, "app-list-housing-offers")),
              EC.url_contains("offre"),
              EC.url_contains("candidatures")
         ))
         
-        logging.info("Login successful (Dashboard detected).")
-        handle_cookie_banner(driver, timeout=1) # Check if banner reappeared
+        logging.info("Login successful (Dashboard or Candidature page detected).")
+        handle_cookie_banner(driver, timeout=1) 
         close_overlays(driver)
         return True
 
@@ -263,9 +264,12 @@ def perform_login(driver, wait, email, password):
         return False
 
 def ensure_logged_in(driver, wait, email, password):
+    # Check if we are already on a logged-in page
     try:
-        driver.find_element(By.CSS_SELECTOR, ".offer-sections")
-        return True
+        if len(driver.find_elements(By.CSS_SELECTOR, ".offer-sections")) > 0:
+            return True
+        if len(driver.find_elements(By.CSS_SELECTOR, ".tdb-s-candidature")) > 0:
+            return True
     except:
         pass
     
@@ -364,12 +368,16 @@ def apply_to_offer(driver, wait):
 def check_and_cancel_candidatures(driver, wait, account):
     candidatures = load_json(account["cand_file"], {})
     
+    # Try to go to candidatures if not there
     try:
-        driver.get("https://al-in.fr/#/mes-candidatures")
-        WebDriverWait(driver, 20).until(EC.presence_of_element_located((By.CSS_SELECTOR, ".tdb-s-candidature")))
+        if "mes-candidatures" not in driver.current_url:
+            driver.get("https://al-in.fr/#/mes-candidatures")
+        
+        # Fast wait
+        WebDriverWait(driver, 10).until(EC.presence_of_element_located((By.CSS_SELECTOR, ".tdb-s-candidature")))
         time.sleep(2)
     except:
-        logging.warning("Could not load 'Mes candidatures'")
+        logging.info("No active candidatures found or page load failed.")
         return
 
     blocks = driver.find_elements(By.CSS_SELECTOR, ".tdb-s-candidature")
@@ -453,17 +461,21 @@ def process_account(account):
     
     try:
         if not ensure_logged_in(driver, wait, email, password):
-            # Try to screenshot specific failure
             driver.save_screenshot(f"login_fail_{account['name']}.png")
             return
+        
+        # 1. First, check status of existing candidatures (since we might be redirected there)
+        check_and_cancel_candidatures(driver, wait, account)
+
+        # 2. Force Navigation to Search to find NEW offers
+        if "recherche-logement" not in driver.current_url:
+            logging.info("Navigating to Search page...")
+            driver.get("https://al-in.fr/#/recherche-logement")
+            time.sleep(3)
 
         found_match = False
         target_offer = None
         
-        if "offre" not in driver.current_url:
-            driver.get("https://al-in.fr/#/recherche-logement")
-            time.sleep(2)
-
         for section_name in account["section_scope"]:
             btn = find_section_button(driver, section_name)
             if not btn:
@@ -524,8 +536,6 @@ def process_account(account):
         
         else:
             logging.info("No new matching offers found.")
-
-        check_and_cancel_candidatures(driver, wait, account)
 
     except Exception as e:
         logging.error(f"Global error for {account['name']}: {e}")
