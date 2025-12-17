@@ -46,7 +46,6 @@ ACCOUNTS = [
         "name": "account1",
         "email_env": "EMAIL_1",
         "pass_env": "PASSWORD_1",
-        # UPDATED: Price range 700 - 850
         "min_price": 700,
         "max_price": 850,
         "min_area": 45,
@@ -59,7 +58,7 @@ ACCOUNTS = [
         "name": "account2",
         "email_env": "EMAIL_2",
         "pass_env": "PASSWORD_2",
-        "min_price": 0,    # No min limit
+        "min_price": 0,
         "max_price": 900,
         "min_area": 0,
         "wanted_typ": "T4|T5",
@@ -253,22 +252,25 @@ def ensure_logged_in(driver, wait, email, password):
 def perform_logout(driver, wait):
     logging.info("Logging out...")
     try:
-        # Ensure overlays are gone before clicking menu
+        # 1. SCROLL TO TOP (Fix for stacktrace issues)
+        driver.execute_script("window.scrollTo(0, 0);")
+        time.sleep(1.0) # Stabilize after scroll
+        
+        # Ensure overlays are gone
         close_overlays(driver)
         
-        # 1. Click "Mon compte"
+        # 2. Click "Mon compte"
         # Using JS click to avoid interception
         mon_compte_btn = wait.until(EC.presence_of_element_located((By.CSS_SELECTOR, "a.lessor-nav-trigger")))
         driver.execute_script("arguments[0].click();", mon_compte_btn)
         
         time.sleep(1.0) # Wait for dropdown animation
 
-        # 2. Click "Deconnexion"
-        # Selector looking for the text inside the dropdown
+        # 3. Click "Deconnexion"
         logout_btn = wait.until(EC.element_to_be_clickable((By.XPATH, "//a[contains(.,'Déconnexion')]")))
         driver.execute_script("arguments[0].click();", logout_btn)
         
-        # 3. Wait for login form to verify logout
+        # 4. Wait for login form to verify logout
         WebDriverWait(driver, 10).until(EC.presence_of_element_located((By.CSS_SELECTOR, "form.global-form")))
         logging.info("Logout successful.")
         return True
