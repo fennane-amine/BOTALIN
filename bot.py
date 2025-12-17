@@ -30,7 +30,7 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(
 # ---------- GLOBAL CONFIG ----------
 BASE_URL = "https://al-in.fr/#/connexion-demandeur"
 
-# Timers optimized for slow site but fast fail
+# Timers optimized
 WAIT_TIMEOUT = int(os.environ.get("WAIT_TIMEOUT", "25"))
 HEADLESS = os.environ.get("HEADLESS", "true").lower() in ("1", "true", "yes")
 MAX_RUN_SECONDS = int(os.environ.get("MAX_RUN_SECONDS", "300"))
@@ -46,7 +46,9 @@ ACCOUNTS = [
         "name": "account1",
         "email_env": "EMAIL_1",
         "pass_env": "PASSWORD_1",
-        "max_price": 800,
+        # UPDATED: Price range 700 - 850
+        "min_price": 700,
+        "max_price": 850,
         "min_area": 45,
         "wanted_typ": "T2",
         "section_scope": ["Communes demandées", "Communes limitrophes"],
@@ -57,6 +59,7 @@ ACCOUNTS = [
         "name": "account2",
         "email_env": "EMAIL_2",
         "pass_env": "PASSWORD_2",
+        "min_price": 0,    # No min limit
         "max_price": 900,
         "min_area": 0,
         "wanted_typ": "T4|T5",
@@ -150,7 +153,7 @@ def close_overlays(driver):
     except:
         pass
 
-def progressive_scroll_container_to_bottom(driver, container, max_attempts=6, pause=0.5):
+def progressive_scroll_container_to_bottom(driver, container, max_attempts=5, pause=0.5):
     try:
         last_height = driver.execute_script("return arguments[0].scrollHeight", container)
         for _ in range(max_attempts):
@@ -248,37 +251,34 @@ def ensure_logged_in(driver, wait, email, password):
     return perform_login(driver, wait, email, password)
 
 def perform_logout(driver, wait):
-    """
-    Log out sequence:
-    1. Click 'Mon compte'
-    2. Click 'Deconnexion'
-    """
     logging.info("Logging out...")
     try:
-        # Click "Mon compte"
-        # Selector: a.lessor-nav-trigger.hi-hmc
-        mon_compte_btn = wait.until(EC.element_to_be_clickable((By.CSS_SELECTOR, "a.lessor-nav-trigger.hi-hmc")))
+        # Ensure overlays are gone before clicking menu
+        close_overlays(driver)
+        
+        # 1. Click "Mon compte"
+        # Using JS click to avoid interception
+        mon_compte_btn = wait.until(EC.presence_of_element_located((By.CSS_SELECTOR, "a.lessor-nav-trigger")))
         driver.execute_script("arguments[0].click();", mon_compte_btn)
-        time.sleep(0.8) # Wait for dropdown
+        
+        time.sleep(1.0) # Wait for dropdown animation
 
-        # Click "Deconnexion"
-        # Selector: a contains 'Déconnexion'
-        logout_btn = wait.until(EC.element_to_be_clickable((By.XPATH, "//a[contains(text(),'Déconnexion')]")))
+        # 2. Click "Deconnexion"
+        # Selector looking for the text inside the dropdown
+        logout_btn = wait.until(EC.element_to_be_clickable((By.XPATH, "//a[contains(.,'Déconnexion')]")))
         driver.execute_script("arguments[0].click();", logout_btn)
         
-        # Wait for login page to reappear
+        # 3. Wait for login form to verify logout
         WebDriverWait(driver, 10).until(EC.presence_of_element_located((By.CSS_SELECTOR, "form.global-form")))
         logging.info("Logout successful.")
-        time.sleep(1) # Safety cooldown
         return True
     except Exception as e:
-        logging.warning(f"Logout failed: {e}")
+        logging.warning(f"Logout failed (non-critical): {e}")
         return False
 
-# ---------- OFFERS SEARCH OPTIMIZED ----------
+# ---------- OFFERS SEARCH ----------
 
 def find_section_button(driver, name):
-    # Short timeout to fail fast if section not present
     xpath = f"//div[contains(@class,'section') and contains(., '{name}')]"
     try:
         return WebDriverWait(driver, 3).until(EC.element_to_be_clickable((By.XPATH, xpath)))
@@ -358,10 +358,6 @@ def apply_to_offer(driver, wait):
         return True, "applied_no_ok"
 
 def verify_and_cancel_new_application(driver, wait, account):
-    """
-    Called IMMEDIATELY after applying.
-    Goes to 'Mes candidatures', checks rank of NEWEST item.
-    """
     logging.info("Verifying rank of new application...")
     try:
         if "mes-candidatures" not in driver.current_url:
@@ -373,10 +369,8 @@ def verify_and_cancel_new_application(driver, wait, account):
         logging.error("Could not load candidatures page.")
         return
 
-    # Assuming first block is the new one
     blocks = driver.find_elements(By.CSS_SELECTOR, ".tdb-s-candidature")
     if not blocks: return
-
     target_block = blocks[0]
 
     try:
@@ -399,7 +393,6 @@ def verify_and_cancel_new_application(driver, wait, account):
                 cancel_btn.click()
                 
                 # Confirm Cancel (Popin 2, button Oui)
-                # HTML: <button class="btn btn-13 btn-outline-primary"> Oui </button>
                 confirm = WebDriverWait(driver, 5).until(
                     EC.element_to_be_clickable((By.CSS_SELECTOR, "button.btn.btn-13.btn-outline-primary"))
                 )
@@ -429,7 +422,7 @@ def process_account(account):
     logging.info(f"--- Starting {account['name']} ---")
     
     driver = init_driver()
-    driver.delete_all_cookies()
+    driver.delete_all_cookies() # Start clean
     wait = WebDriverWait(driver, WAIT_TIMEOUT)
     seen = set(load_json(account["seen_file"], []))
     
@@ -442,7 +435,6 @@ def process_account(account):
             logging.info("Navigating to Search page...")
             driver.get("https://al-in.fr/#/recherche-logement")
             try:
-                # Wait briefly for container, if slow, proceed anyway
                 WebDriverWait(driver, 8).until(EC.presence_of_element_located((By.CSS_SELECTOR, ".offer-list-container")))
             except: pass
 
@@ -469,8 +461,11 @@ def process_account(account):
                 if not info or not info["uid"]: continue
                 if info["uid"] in seen: continue
                 
-                # Criteria
-                if info["price"] and info["price"] > account["max_price"]: continue
+                # UPDATED CRITERIA CHECK
+                if info["price"]:
+                    if info["price"] > account["max_price"]: continue
+                    if info["price"] < account.get("min_price", 0): continue
+                
                 if info["area"] and account["min_area"] > 0 and info["area"] < account["min_area"]: continue
                 if not re.search(account["wanted_typ"], info["typ"] or "", re.IGNORECASE): continue
                 
@@ -503,7 +498,6 @@ def process_account(account):
         else:
             logging.info("No new matching offers found.")
         
-        # LOGOUT AT THE END
         perform_logout(driver, wait)
 
     except Exception as e:
