@@ -16,8 +16,6 @@ from selenium.webdriver.chrome.options import Options
 from selenium.webdriver.chrome.service import Service
 from selenium.common.exceptions import (
     TimeoutException,
-    ElementClickInterceptedException,
-    NoSuchElementException,
     StaleElementReferenceException
 )
 from selenium.webdriver.support.ui import WebDriverWait
@@ -46,8 +44,8 @@ ACCOUNTS = [
         "name": "account1",
         "email_env": "EMAIL_1",
         "pass_env": "PASSWORD_1",
-        "min_price": 700,    # UPDATED
-        "max_price": 850,    # UPDATED
+        "min_price": 700,
+        "max_price": 850,
         "min_area": 45,
         "wanted_typ": "T2",
         "section_scope": ["Communes demandées", "Communes limitrophes"],
@@ -252,16 +250,14 @@ def ensure_logged_in(driver, wait, email, password):
 def perform_logout(driver, wait):
     logging.info("Logging out...")
     try:
-        # 1. CRITICAL FIX: SCROLL TO TOP
+        # 1. SCROLL TO TOP
         driver.execute_script("window.scrollTo(0, 0);")
         time.sleep(1.0) 
-        
         close_overlays(driver)
         
         # 2. Click "Mon compte"
         mon_compte_btn = wait.until(EC.presence_of_element_located((By.CSS_SELECTOR, "a.lessor-nav-trigger")))
         driver.execute_script("arguments[0].click();", mon_compte_btn)
-        
         time.sleep(1.0) 
 
         # 3. Click "Deconnexion"
@@ -357,6 +353,24 @@ def apply_to_offer(driver, wait):
         logging.warning("'Ok' button missed, assuming success.")
         return True, "applied_no_ok"
 
+def extract_rank_from_text(text):
+    """
+    Extracts rank from either "Position X" or "Il y a actuellement X candidatures"
+    """
+    if not text: return 999
+    
+    # Case 1: "Position 5"
+    m = re.search(r"Position\s*[\n\r]*\s*(\d{1,3})", text, re.IGNORECASE)
+    if m:
+        return int(m.group(1))
+    
+    # Case 2: "Il y a actuellement 14 candidatures" (Implies rank approx = count)
+    m2 = re.search(r"actuellement\s*(\d{1,4})\s*candidatures", text, re.IGNORECASE)
+    if m2:
+        return int(m2.group(1))
+        
+    return 999
+
 def verify_and_cancel_new_application(driver, wait, account):
     logging.info("Verifying rank of new application...")
     try:
@@ -374,17 +388,18 @@ def verify_and_cancel_new_application(driver, wait, account):
     target_block = blocks[0]
 
     try:
-        rank = 999
         try:
-            txt = target_block.text
-            m = re.search(r"Position\s*(\d+)", txt, re.IGNORECASE)
-            if m:
-                rank = int(m.group(1))
-        except: pass
+            title_el = target_block.find_element(By.CSS_SELECTOR, ".title")
+            title_text = title_el.text.strip()
+        except:
+            title_text = "Offre Inconnue"
+
+        raw_text = target_block.text
+        rank = extract_rank_from_text(raw_text)
         
         logging.info(f"New Application Rank detected: {rank}")
 
-        if rank > 10:
+        if 10 < rank < 999:
             logging.warning(f"Rank {rank} > 10. Cancelling immediately.")
             try:
                 # Click 'Annuler cette candidature'
@@ -398,12 +413,37 @@ def verify_and_cancel_new_application(driver, wait, account):
                 )
                 confirm.click()
                 logging.info("IMMEDIATE CANCELLATION SUCCESSFUL.")
-                send_email(f"BOTALIN - AUTO CANCEL ({account['name']})", f"Candidature annulee car rang {rank} > 10.")
+                
+                body = f"""
+                Compte: {account['name']}
+                Offre: {title_text}
+                Action: Annulation automatique
+                Raison: Rang {rank} > 10
+                """
+                send_email(f"BOTALIN - AUTO CANCEL ({account['name']})", body)
             except Exception as e:
                 logging.error(f"Failed to auto-cancel: {e}")
+        elif rank == 999:
+            logging.warning("Rank could not be parsed (999). Keeping candidature to be safe.")
+            body = f"""
+            Compte: {account['name']}
+            Offre: {title_text}
+            Action: Candidature conservée (Rang illisible)
+            Rang détecté: 999 (Illisible)
+            
+            --- TEXTE BRUT ---
+            {raw_text[:600]}
+            """
+            send_email(f"BOTALIN - RANG ILLISIBLE ({account['name']})", body)
         else:
             logging.info(f"Rank {rank} is good (<= 10).")
-            send_email(f"BOTALIN - SUCCESS ({account['name']})", f"Nouvelle candidature confirmee.\nRang: {rank}")
+            body = f"""
+            Compte: {account['name']}
+            Offre: {title_text}
+            Action: Succès (Gardée)
+            Rang: {rank}
+            """
+            send_email(f"BOTALIN - SUCCES ({account['name']})", body)
 
     except Exception as e:
         logging.error(f"Error checking rank: {e}")
