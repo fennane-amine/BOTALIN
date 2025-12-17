@@ -30,7 +30,8 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(
 # ---------- GLOBAL CONFIG ----------
 BASE_URL = "https://al-in.fr/#/connexion-demandeur"
 
-WAIT_TIMEOUT = int(os.environ.get("WAIT_TIMEOUT", "15"))
+# Increased timeouts for stability
+WAIT_TIMEOUT = int(os.environ.get("WAIT_TIMEOUT", "20"))
 HEADLESS = os.environ.get("HEADLESS", "true").lower() in ("1", "true", "yes")
 MAX_RUN_SECONDS = int(os.environ.get("MAX_RUN_SECONDS", "300"))
 
@@ -112,8 +113,6 @@ def save_json(path, data):
 def parse_price(price_text: str):
     if not price_text:
         return None
-    # Handle "583 € (531 € Hors charge)" -> extract 583
-    # Clean string first
     cleaned = price_text.replace("\u00A0", " ").strip()
     m = re.search(r"^(\d+(?:[ ]\d+)*)", cleaned)
     if m:
@@ -126,7 +125,6 @@ def parse_price(price_text: str):
 def parse_area_from_typology(typ_text: str):
     if not typ_text:
         return None
-    # Handle "24m2 | T1"
     cleaned = typ_text.replace("\u00A0", " ").replace(",", ".")
     m = re.search(r"(\d+(?:\.\d+)?)\s*m", cleaned, re.IGNORECASE)
     if m:
@@ -138,25 +136,34 @@ def parse_area_from_typology(typ_text: str):
 
 # ---------- UI helpers ----------
 
-def handle_cookie_banner(driver, timeout=3):
+def handle_cookie_banner(driver, timeout=5):
+    # Updated selectors based on provided HTML
     selectors = [
+        "button[data-cookiefirst-action='accept']",  # Robust selector from your HTML
         "//button[contains(., 'Accepter tous les cookies')]",
-        "//button[contains(., 'Tout accepter')]",
-        "//button[contains(., 'Accepter')]",
-        "//button[contains(@class,'cookie')]",
+        "//button[contains(@class, 'cf2Lf6') and contains(., 'Accepter')]",
     ]
     for s in selectors:
         try:
-            el = WebDriverWait(driver, timeout).until(EC.element_to_be_clickable((By.XPATH, s)))
-            driver.execute_script("arguments[0].click();", el)
+            if s.startswith("//"):
+                el = WebDriverWait(driver, timeout).until(EC.element_to_be_clickable((By.XPATH, s)))
+            else:
+                el = WebDriverWait(driver, timeout).until(EC.element_to_be_clickable((By.CSS_SELECTOR, s)))
+            
+            # Click
+            try:
+                el.click()
+            except:
+                driver.execute_script("arguments[0].click();", el)
+            
             logging.info("✅ Bannière cookies acceptée.")
+            time.sleep(1.0) # Wait for banner to disappear
             return True
         except Exception:
             continue
     return False
 
 def close_overlays(driver):
-    # Try generic close buttons often found in overlays
     try:
         overlays = driver.find_elements(By.CSS_SELECTOR, ".p-dialog-header-close-icon, button.close, .modal-close")
         for ov in overlays:
@@ -167,7 +174,6 @@ def close_overlays(driver):
         pass
 
 def progressive_scroll_container_to_bottom(driver, container, max_attempts=CONTAINER_SCROLL_ATTEMPTS, pause=SCROLL_PAUSE):
-    # Scroll logic tailored for al-in lists
     try:
         last_height = driver.execute_script("return arguments[0].scrollHeight", container)
         for _ in range(max_attempts):
@@ -206,46 +212,45 @@ def init_driver():
         driver = webdriver.Chrome(service=service, options=options)
         return driver
 
-# ---------- Login flow (HTML based) ----------
+# ---------- Login flow (Updated) ----------
 
 def perform_login(driver, wait, email, password):
     driver.get(BASE_URL)
-    handle_cookie_banner(driver, timeout=2)
+    handle_cookie_banner(driver, timeout=3)
     
     try:
-        # Wait for form
         wait.until(EC.presence_of_element_located((By.CSS_SELECTOR, "form.global-form")))
         
-        # Input: formcontrolname="mail"
         mail_input = wait.until(EC.presence_of_element_located((By.CSS_SELECTOR, 'input[formcontrolname="mail"]')))
         mail_input.clear()
         mail_input.send_keys(email)
         
-        # Input: formcontrolname="password"
         pwd_input = wait.until(EC.presence_of_element_located((By.CSS_SELECTOR, 'input[formcontrolname="password"]')))
         pwd_input.clear()
         pwd_input.send_keys(password)
         
-        # Button: class contains 'btnCreate'
+        # Click login
         btn = wait.until(EC.element_to_be_clickable((By.CSS_SELECTOR, "button.btnCreate")))
         driver.execute_script("arguments[0].scrollIntoView(true);", btn)
-        time.sleep(0.5)
+        time.sleep(0.8)
         
         try:
             btn.click()
         except:
             driver.execute_script("arguments[0].click();", btn)
             
-        # Wait for redirection to dashboard (offers or candidatures)
-        # We look for "offer-sections" or "Mes candidatures" text
-        WebDriverWait(driver, 20).until(EC.any_of(
+        logging.info("Clicked login button. Waiting for dashboard...")
+
+        # Wait longer for dashboard (up to 30s)
+        WebDriverWait(driver, 30).until(EC.any_of(
              EC.presence_of_element_located((By.CSS_SELECTOR, ".offer-sections")),
-             EC.presence_of_element_located((By.XPATH, "//a[contains(@href,'mes-candidatures')]")),
-             EC.url_contains("offre")
+             EC.presence_of_element_located((By.CSS_SELECTOR, "app-list-housing-offers")),
+             EC.url_contains("offre"),
+             EC.url_contains("candidatures")
         ))
         
-        logging.info("Login successful.")
-        handle_cookie_banner(driver, timeout=1)
+        logging.info("Login successful (Dashboard detected).")
+        handle_cookie_banner(driver, timeout=1) # Check if banner reappeared
         close_overlays(driver)
         return True
 
@@ -258,7 +263,6 @@ def perform_login(driver, wait, email, password):
         return False
 
 def ensure_logged_in(driver, wait, email, password):
-    # Quick check if already logged in
     try:
         driver.find_element(By.CSS_SELECTOR, ".offer-sections")
         return True
@@ -268,11 +272,9 @@ def ensure_logged_in(driver, wait, email, password):
     logging.info("Not logged in or session expired. Logging in...")
     return perform_login(driver, wait, email, password)
 
-# ---------- Offers Parsing (HTML based) ----------
+# ---------- Offers Parsing ----------
 
 def find_section_button(driver, name):
-    # Sections: "Communes demandées", etc.
-    # HTML: <div class="section"> Communes demandées <span>0</span></div>
     xpath = f"//div[contains(@class,'section') and contains(., '{name}')]"
     try:
         return WebDriverWait(driver, 5).until(EC.element_to_be_clickable((By.XPATH, xpath)))
@@ -280,17 +282,14 @@ def find_section_button(driver, name):
         return None
 
 def extract_offer_from_card(card):
-    # Based on HTML: app-offer-card -> offer-card-container
     info = {"uid": None, "price": None, "typ": None, "loc": None, "area": None, "raw_price": "", "img_src": None}
     try:
-        # Image (used as UID)
         try:
             img_el = card.find_element(By.CSS_SELECTOR, ".offer-image img")
             info["img_src"] = img_el.get_attribute("src")
         except:
             pass
         
-        # Price: <div class="price"> 583 € <span>(531 € Hors charge)</span></div>
         try:
             price_el = card.find_element(By.CSS_SELECTOR, ".price")
             info["raw_price"] = price_el.text.strip()
@@ -298,7 +297,6 @@ def extract_offer_from_card(card):
         except:
             pass
             
-        # Typology: <div class="typology"> 24m2 <span> | T1</span></div>
         try:
             typ_el = card.find_element(By.CSS_SELECTOR, ".typology")
             info["typ"] = typ_el.text.strip()
@@ -306,18 +304,15 @@ def extract_offer_from_card(card):
         except:
             pass
             
-        # Location: <div class="location">Paris (75010)</div>
         try:
             loc_el = card.find_element(By.CSS_SELECTOR, ".location")
             info["loc"] = loc_el.text.strip()
         except:
             pass
         
-        # UID strategy: image src OR composite key
         if info["img_src"] and "assets/img" not in info["img_src"]:
             info["uid"] = info["img_src"]
         else:
-            # Fallback UID
             info["uid"] = f"{info['loc']}-{info['price']}-{info['typ']}"
             
     except StaleElementReferenceException:
@@ -325,18 +320,11 @@ def extract_offer_from_card(card):
         
     return info
 
-# ---------- Apply Flow (HTML based) ----------
+# ---------- Apply Flow ----------
 
 def apply_to_offer(driver, wait):
-    """
-    Handles the 3-step application:
-    1. Click 'Je postule' (Page Detail)
-    2. Click 'Confirmer' (Popup 1)
-    3. Click 'Ok' (Popup 2)
-    """
-    # 1. Click "Je postule"
+    # 1. Je postule
     try:
-        # selector: .btn.btn-secondary.hi-check-round
         apply_btn = wait.until(EC.element_to_be_clickable((By.CSS_SELECTOR, "button.btn.btn-secondary.hi-check-round")))
         driver.execute_script("arguments[0].scrollIntoView({block:'center'});", apply_btn)
         time.sleep(0.5)
@@ -346,21 +334,19 @@ def apply_to_offer(driver, wait):
         logging.error(f"Failed to click 'Je postule': {e}")
         return False, "btn_not_found"
 
-    # 2. Popup 1: "Confirmer"
-    # HTML: <button class="btn btn-13 btn-secondary mt10 mb10"> Confirmer </button>
+    # 2. Confirmer
     try:
         confirm_btn = WebDriverWait(driver, 5).until(
             EC.element_to_be_clickable((By.XPATH, "//button[contains(@class,'btn-13') and contains(.,'Confirmer')]"))
         )
         time.sleep(0.5)
         confirm_btn.click()
-        logging.info("Clicked 'Confirmer' in popup")
+        logging.info("Clicked 'Confirmer'")
     except Exception as e:
         logging.error(f"Failed to confirm application: {e}")
         return False, "confirm_failed"
 
-    # 3. Popup 2: "Ok" (Success)
-    # HTML: <button class="btn btn-13 btn-secondary mt10 mb10"> Ok </button>
+    # 3. Ok
     try:
         ok_btn = WebDriverWait(driver, 8).until(
             EC.element_to_be_clickable((By.XPATH, "//button[contains(@class,'btn-13') and contains(.,'Ok')]"))
@@ -370,89 +356,59 @@ def apply_to_offer(driver, wait):
         logging.info("Clicked 'Ok' (Success)")
         return True, "applied"
     except Exception:
-        # If OK button didn't appear, maybe it failed or auto-closed
-        logging.warning("Success 'Ok' button not found, assuming applied or error.")
+        logging.warning("Success 'Ok' button not found, assuming applied.")
         return True, "applied_no_ok"
 
-# ---------- Candidature Status & Cancellation ----------
+# ---------- Candidature Status ----------
 
 def check_and_cancel_candidatures(driver, wait, account):
-    """
-    Goes to 'Mes candidatures', checks rank. 
-    If rank > 10, cancels the application.
-    Updates status file.
-    """
     candidatures = load_json(account["cand_file"], {})
     
-    # Navigate
     try:
         driver.get("https://al-in.fr/#/mes-candidatures")
-        WebDriverWait(driver, 15).until(EC.presence_of_element_located((By.CSS_SELECTOR, ".tdb-s-candidature")))
+        WebDriverWait(driver, 20).until(EC.presence_of_element_located((By.CSS_SELECTOR, ".tdb-s-candidature")))
         time.sleep(2)
     except:
         logging.warning("Could not load 'Mes candidatures'")
         return
 
-    # Scan blocks
     blocks = driver.find_elements(By.CSS_SELECTOR, ".tdb-s-candidature")
     logging.info(f"Checking {len(blocks)} active candidatures...")
     
     for block in blocks:
         try:
-            # Extract Title/UID info
             try:
                 title_el = block.find_element(By.CSS_SELECTOR, ".title")
-                title_text = title_el.text.strip() # ex: T1 | Paris (75) | 583 €
+                title_text = title_el.text.strip()
             except:
                 title_text = "Unknown"
 
-            # UID Key strategy (needs to match offer uid if possible, otherwise use title)
             uid_key = title_text 
-            
-            # Extract Rank
-            # HTML: <div class="col... al-border"> <div class="text"> Position </div> <div ... text_picto_vert"> Il y a ...</div> </div>
-            # Sometimes rank is explicitly "Position 3", sometimes just "Il y a X candidatures" (which implies rank unknown or > threshold)
-            rank = 999 # Default to high if unknown
+            rank = 999 
             
             try:
-                # Try to find specific Position text if available
-                # Text content usually: "Position" then next div has number
-                # Or looking for "Position X"
                 full_text = block.text
                 m_pos = re.search(r"Position\s*(\d+)", full_text, re.IGNORECASE)
                 if m_pos:
                     rank = int(m_pos.group(1))
-                else:
-                    # Logic: if text says "Il y a X candidatures", we might assume rank is bad? 
-                    # For safety: if we can't find explicit "Position X", we DO NOT cancel to avoid errors.
-                    pass
             except:
                 pass
 
-            # Extract Status
             status = "Inconnu"
             try:
-                # Look for "Statut de la demande" block
                 status_block = block.find_element(By.XPATH, ".//*[contains(text(),'Statut de la demande')]/following-sibling::div/span")
                 status = status_block.text.strip()
             except:
                 pass
             
-            # Logic: Cancel if Rank > 10
-            # Only if we are SURE about the rank
-            if 0 < rank <= 10:
-                logging.info(f"Keep: {title_text} (Rank {rank})")
-            elif rank > 10 and rank != 999:
+            # Cancel rule: Rank > 10
+            if rank > 10 and rank != 999:
                 logging.info(f"Cancelling: {title_text} (Rank {rank} > 10)")
-                # Click "Annuler cette candidature"
-                # Selector: a.tool-link.hi-cross-round
                 try:
                     cancel_btn = block.find_element(By.CSS_SELECTOR, "a.tool-link.hi-cross-round")
                     driver.execute_script("arguments[0].scrollIntoView({block:'center'});", cancel_btn)
                     cancel_btn.click()
                     
-                    # Confirm cancel popup
-                    # Usually standard primeNg confirm dialog
                     confirm_cancel = WebDriverWait(driver, 5).until(
                         EC.element_to_be_clickable((By.XPATH, "//button[contains(.,'OK') or contains(.,'Confirmer')]"))
                     )
@@ -462,8 +418,6 @@ def check_and_cancel_candidatures(driver, wait, account):
                 except Exception as e:
                     logging.error(f"Failed to cancel: {e}")
 
-            # Save status
-            # Detect changes to notify
             old_data = candidatures.get(uid_key, {})
             if old_data.get("status") != status:
                 send_email(f"BOTALIN Update ({account['name']})", f"Offre: {title_text}\nNouveau statut: {status}\nRang détecté: {rank}")
@@ -499,13 +453,13 @@ def process_account(account):
     
     try:
         if not ensure_logged_in(driver, wait, email, password):
+            # Try to screenshot specific failure
+            driver.save_screenshot(f"login_fail_{account['name']}.png")
             return
 
-        # 1. Search for offers
         found_match = False
         target_offer = None
         
-        # Go to offers page if not there
         if "offre" not in driver.current_url:
             driver.get("https://al-in.fr/#/recherche-logement")
             time.sleep(2)
@@ -514,22 +468,19 @@ def process_account(account):
             btn = find_section_button(driver, section_name)
             if not btn:
                 continue
-                
-            # Click section
+            
             try:
                 driver.execute_script("arguments[0].click();", btn)
                 time.sleep(1.5)
             except:
                 pass
             
-            # Scroll container
             try:
                 container = driver.find_element(By.CSS_SELECTOR, ".offer-list-container")
                 progressive_scroll_container_to_bottom(driver, container, max_attempts=5)
             except:
                 pass
 
-            # Scan cards
             cards = driver.find_elements(By.CSS_SELECTOR, "app-offer-card")
             for card in cards:
                 info = extract_offer_from_card(card)
@@ -538,15 +489,12 @@ def process_account(account):
                 if info["uid"] in seen:
                     continue
                 
-                # Check criteria
                 if info["price"] and info["price"] > account["max_price"]: continue
                 if info["area"] and account["min_area"] > 0 and info["area"] < account["min_area"]: continue
                 
-                # Typology regex check
                 if not re.search(account["wanted_typ"], info["typ"] or "", re.IGNORECASE):
                     continue
                 
-                # FOUND!
                 target_offer = (card, info)
                 found_match = True
                 break
@@ -554,22 +502,18 @@ def process_account(account):
             if found_match:
                 break
         
-        # 2. Apply if found
         if found_match and target_offer:
             card_elem, info = target_offer
             logging.info(f"Applying to: {info}")
             
-            # Click card to open detail
             try:
                 driver.execute_script("arguments[0].scrollIntoView({block:'center'});", card_elem)
                 card_elem.click()
             except:
                 driver.execute_script("arguments[0].click();", card_elem)
             
-            # Application flow
             success, reason = apply_to_offer(driver, wait)
             
-            # Mark seen regardless of result to avoid loops
             seen.add(info["uid"])
             save_json(account["seen_file"], list(seen))
             
@@ -581,7 +525,6 @@ def process_account(account):
         else:
             logging.info("No new matching offers found.")
 
-        # 3. Check & Cancel logic
         check_and_cancel_candidatures(driver, wait, account)
 
     except Exception as e:
