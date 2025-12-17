@@ -51,18 +51,26 @@ jobs:
 
       - name: Run AL-IN bot (5 minutes)
         env:
-          EMAIL: ${{ secrets.EMAIL }}
-          PASSWORD: ${{ secrets.PASSWORD }}
+          # --- NOUVEAUX SECRETS POUR LES 2 COMPTES ---
+          EMAIL_1: ${{ secrets.EMAIL_1 }}
+          PASSWORD_1: ${{ secrets.PASSWORD_1 }}
+          EMAIL_2: ${{ secrets.EMAIL_2 }}
+          PASSWORD_2: ${{ secrets.PASSWORD_2 }}
+          
+          # Configuration Email
           SENDER_EMAIL: ${{ secrets.SENDER_EMAIL }}
           SENDER_PASS: ${{ secrets.SENDER_PASS }}
-          RECIPIENT_EMAIL: ${{ secrets.RECIPIENT_EMAIL }}
+          # Les destinataires sont définis dans le code python, mais on peut les forcer ici si besoin
+          RECIPIENT_EMAIL: "fennane.mohamedamine@gmail.com, abdelhakim.fennane@sncf.fr"
+          
+          # Paramètres
           MAX_RUN_SECONDS: 300
           POLL_INTERVAL: 15
           HEADLESS: true
         run: |
           python bot.py
 
-      - name: Commit offers_seen.json & candidatures_status.json if changed
+      - name: Commit offers_seen & candidatures_status JSONs if changed
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           PAT_FOR_PUSH: ${{ secrets.PAT_FOR_PUSH }}
@@ -76,16 +84,14 @@ jobs:
             git config user.email "github-actions[bot]@users.noreply.github.com"
           fi
 
-          if [[ -f offers_seen.json || -f candidatures_status.json ]]; then
-            git add offers_seen.json candidatures_status.json || true
-            if ! git diff --cached --quiet; then
-              git commit -m "Update seen & candidature status files" || true
-              git push origin HEAD || true
-            else
-              echo "No changes to commit."
-            fi
+          # On ajoute les fichiers JSON pour les DEUX comptes (wildcard)
+          git add offers_seen_account*.json candidatures_status_account*.json || true
+          
+          if ! git diff --cached --quiet; then
+            git commit -m "Update seen & candidature status files for accounts" || true
+            git push origin HEAD || true
           else
-            echo "No files to commit."
+            echo "No changes to commit."
           fi
 
       - name: Upload screenshot on failure
