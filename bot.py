@@ -46,8 +46,8 @@ ACCOUNTS = [
         "name": "account1",
         "email_env": "EMAIL_1",
         "pass_env": "PASSWORD_1",
-        "min_price": 700,
-        "max_price": 850,
+        "min_price": 700,    # UPDATED
+        "max_price": 850,    # UPDATED
         "min_area": 45,
         "wanted_typ": "T2",
         "section_scope": ["Communes demandées", "Communes limitrophes"],
@@ -252,25 +252,23 @@ def ensure_logged_in(driver, wait, email, password):
 def perform_logout(driver, wait):
     logging.info("Logging out...")
     try:
-        # 1. SCROLL TO TOP (Fix for stacktrace issues)
+        # 1. CRITICAL FIX: SCROLL TO TOP
         driver.execute_script("window.scrollTo(0, 0);")
-        time.sleep(1.0) # Stabilize after scroll
+        time.sleep(1.0) 
         
-        # Ensure overlays are gone
         close_overlays(driver)
         
         # 2. Click "Mon compte"
-        # Using JS click to avoid interception
         mon_compte_btn = wait.until(EC.presence_of_element_located((By.CSS_SELECTOR, "a.lessor-nav-trigger")))
         driver.execute_script("arguments[0].click();", mon_compte_btn)
         
-        time.sleep(1.0) # Wait for dropdown animation
+        time.sleep(1.0) 
 
         # 3. Click "Deconnexion"
         logout_btn = wait.until(EC.element_to_be_clickable((By.XPATH, "//a[contains(.,'Déconnexion')]")))
         driver.execute_script("arguments[0].click();", logout_btn)
         
-        # 4. Wait for login form to verify logout
+        # 4. Wait for login form
         WebDriverWait(driver, 10).until(EC.presence_of_element_located((By.CSS_SELECTOR, "form.global-form")))
         logging.info("Logout successful.")
         return True
