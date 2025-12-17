@@ -30,8 +30,8 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(
 # ---------- GLOBAL CONFIG ----------
 BASE_URL = "https://al-in.fr/#/connexion-demandeur"
 
-# Reduced timeouts for speed. The site is slow, but waiting 30s blocks the bot too long.
-WAIT_TIMEOUT = int(os.environ.get("WAIT_TIMEOUT", "15"))
+# Timers optimized for slow site but fast fail
+WAIT_TIMEOUT = int(os.environ.get("WAIT_TIMEOUT", "25"))
 HEADLESS = os.environ.get("HEADLESS", "true").lower() in ("1", "true", "yes")
 MAX_RUN_SECONDS = int(os.environ.get("MAX_RUN_SECONDS", "300"))
 
@@ -49,7 +49,6 @@ ACCOUNTS = [
         "max_price": 800,
         "min_area": 45,
         "wanted_typ": "T2",
-        # UPDATED: Checks Demandées THEN Limitrophes
         "section_scope": ["Communes demandées", "Communes limitrophes"],
         "seen_file": "offers_seen_account1.json",
         "cand_file": "candidatures_status_account1.json",
@@ -61,23 +60,16 @@ ACCOUNTS = [
         "max_price": 900,
         "min_area": 0,
         "wanted_typ": "T4|T5",
-        # UPDATED: Only Demandées
         "section_scope": ["Communes demandées"],
         "seen_file": "offers_seen_account2.json",
         "cand_file": "candidatures_status_account2.json",
     }
 ]
 
-# ---------- GENERAL SETTINGS ----------
-CLICK_RETRIES = 3
-SCROLL_PAUSE = 0.5
-CONTAINER_SCROLL_ATTEMPTS = 10
-
 # ---------- HELPERS ----------
 
 def send_email(subject: str, body: str) -> bool:
     if not SENDER_EMAIL or not SENDER_PASS or not RECIPIENT_EMAIL:
-        logging.warning("SMTP not configured: skip send_email.")
         return False
     msg = EmailMessage()
     msg["From"] = SENDER_EMAIL
@@ -158,7 +150,7 @@ def close_overlays(driver):
     except:
         pass
 
-def progressive_scroll_container_to_bottom(driver, container, max_attempts=10, pause=0.4):
+def progressive_scroll_container_to_bottom(driver, container, max_attempts=6, pause=0.5):
     try:
         last_height = driver.execute_script("return arguments[0].scrollHeight", container)
         for _ in range(max_attempts):
@@ -181,7 +173,6 @@ def init_driver():
     options.add_argument("--disable-dev-shm-usage")
     options.add_argument("--window-size=1920,1080")
     options.add_argument("--disable-gpu")
-    # Speed optimization: Eager strategy (DOMContentLoaded) instead of full Load
     options.page_load_strategy = 'eager'
     options.add_argument(f"--user-data-dir=/tmp/chrome_user_data_{os.getpid()}")
 
@@ -196,17 +187,15 @@ def init_driver():
         service = Service(driver_path)
         driver = webdriver.Chrome(service=service, options=options)
     
-    # Global timeout for script execution to prevent hanging
-    driver.set_page_load_timeout(40)
+    driver.set_page_load_timeout(60)
     return driver
 
-# ---------- LOGIN ----------
+# ---------- LOGIN / LOGOUT ----------
 
 def perform_login(driver, wait, email, password):
     try:
         driver.get(BASE_URL)
     except TimeoutException:
-        logging.warning("Page load timeout on login page, stopping loading and trying to find form.")
         driver.execute_script("window.stop();")
 
     handle_cookie_banner(driver, timeout=3)
@@ -233,8 +222,7 @@ def perform_login(driver, wait, email, password):
             
         logging.info("Clicked login. Waiting for next page...")
 
-        # Wait for either Search Dashboard OR Candidatures page
-        WebDriverWait(driver, 20).until(EC.any_of(
+        WebDriverWait(driver, 30).until(EC.any_of(
              EC.presence_of_element_located((By.CSS_SELECTOR, ".offer-sections")),
              EC.presence_of_element_located((By.CSS_SELECTOR, ".tdb-s-candidature")),
              EC.url_contains("offre"),
@@ -251,7 +239,6 @@ def perform_login(driver, wait, email, password):
         return False
 
 def ensure_logged_in(driver, wait, email, password):
-    # Quick check
     try:
         if len(driver.find_elements(By.CSS_SELECTOR, ".offer-sections")) > 0: return True
         if "candidature" in driver.current_url: return True
@@ -260,9 +247,38 @@ def ensure_logged_in(driver, wait, email, password):
     logging.info("Not logged in. Logging in...")
     return perform_login(driver, wait, email, password)
 
-# ---------- OFFERS ----------
+def perform_logout(driver, wait):
+    """
+    Log out sequence:
+    1. Click 'Mon compte'
+    2. Click 'Deconnexion'
+    """
+    logging.info("Logging out...")
+    try:
+        # Click "Mon compte"
+        # Selector: a.lessor-nav-trigger.hi-hmc
+        mon_compte_btn = wait.until(EC.element_to_be_clickable((By.CSS_SELECTOR, "a.lessor-nav-trigger.hi-hmc")))
+        driver.execute_script("arguments[0].click();", mon_compte_btn)
+        time.sleep(0.8) # Wait for dropdown
+
+        # Click "Deconnexion"
+        # Selector: a contains 'Déconnexion'
+        logout_btn = wait.until(EC.element_to_be_clickable((By.XPATH, "//a[contains(text(),'Déconnexion')]")))
+        driver.execute_script("arguments[0].click();", logout_btn)
+        
+        # Wait for login page to reappear
+        WebDriverWait(driver, 10).until(EC.presence_of_element_located((By.CSS_SELECTOR, "form.global-form")))
+        logging.info("Logout successful.")
+        time.sleep(1) # Safety cooldown
+        return True
+    except Exception as e:
+        logging.warning(f"Logout failed: {e}")
+        return False
+
+# ---------- OFFERS SEARCH OPTIMIZED ----------
 
 def find_section_button(driver, name):
+    # Short timeout to fail fast if section not present
     xpath = f"//div[contains(@class,'section') and contains(., '{name}')]"
     try:
         return WebDriverWait(driver, 3).until(EC.element_to_be_clickable((By.XPATH, xpath)))
@@ -303,10 +319,10 @@ def extract_offer_from_card(card):
         return None
     return info
 
-# ---------- ACTIONS ----------
+# ---------- APPLY & CANCEL ----------
 
 def apply_to_offer(driver, wait):
-    # Click "Je postule"
+    # 1. Je postule
     try:
         apply_btn = wait.until(EC.element_to_be_clickable((By.CSS_SELECTOR, "button.btn.btn-secondary.hi-check-round")))
         driver.execute_script("arguments[0].scrollIntoView({block:'center'});", apply_btn)
@@ -317,9 +333,9 @@ def apply_to_offer(driver, wait):
         logging.error(f"Failed to click 'Je postule': {e}")
         return False, "btn_not_found"
 
-    # Confirm
+    # 2. Confirmer (Popin 1)
     try:
-        confirm_btn = WebDriverWait(driver, 5).until(
+        confirm_btn = WebDriverWait(driver, 8).until(
             EC.element_to_be_clickable((By.XPATH, "//button[contains(@class,'btn-13') and contains(.,'Confirmer')]"))
         )
         time.sleep(0.3)
@@ -328,9 +344,9 @@ def apply_to_offer(driver, wait):
     except Exception:
         return False, "confirm_failed"
 
-    # Ok
+    # 3. Ok (Popin 2)
     try:
-        ok_btn = WebDriverWait(driver, 5).until(
+        ok_btn = WebDriverWait(driver, 8).until(
             EC.element_to_be_clickable((By.XPATH, "//button[contains(@class,'btn-13') and contains(.,'Ok')]"))
         )
         time.sleep(0.3)
@@ -341,39 +357,29 @@ def apply_to_offer(driver, wait):
         logging.warning("'Ok' button missed, assuming success.")
         return True, "applied_no_ok"
 
-def verify_and_cancel_new_application(driver, wait, account, offer_uid):
+def verify_and_cancel_new_application(driver, wait, account):
     """
-    Called IMMEDIATELY after applying to an offer.
-    Goes to 'Mes candidatures', finds the latest one, checks rank.
-    If rank > 10, cancels it.
+    Called IMMEDIATELY after applying.
+    Goes to 'Mes candidatures', checks rank of NEWEST item.
     """
     logging.info("Verifying rank of new application...")
     try:
         if "mes-candidatures" not in driver.current_url:
             driver.get("https://al-in.fr/#/mes-candidatures")
         
-        WebDriverWait(driver, 10).until(EC.presence_of_element_located((By.CSS_SELECTOR, ".tdb-s-candidature")))
-        time.sleep(1.5) # Let animation finish
+        WebDriverWait(driver, 15).until(EC.presence_of_element_located((By.CSS_SELECTOR, ".tdb-s-candidature")))
+        time.sleep(1.5) 
     except:
-        logging.error("Could not load candidatures page to verify rank.")
+        logging.error("Could not load candidatures page.")
         return
 
-    # Find the matching block (the one we just added should be at the top or match the UID/Title)
+    # Assuming first block is the new one
     blocks = driver.find_elements(By.CSS_SELECTOR, ".tdb-s-candidature")
-    target_block = None
-    
-    # Heuristic: First block is usually the newest. 
-    # But better to check matches if possible, though UID is hard to match here.
-    # We will assume the first block is the one we just processed.
-    if blocks:
-        target_block = blocks[0]
-        
-    if not target_block:
-        logging.warning("No candidature blocks found.")
-        return
+    if not blocks: return
+
+    target_block = blocks[0]
 
     try:
-        # Check Rank
         rank = 999
         try:
             txt = target_block.text
@@ -387,12 +393,15 @@ def verify_and_cancel_new_application(driver, wait, account, offer_uid):
         if rank > 10:
             logging.warning(f"Rank {rank} > 10. Cancelling immediately.")
             try:
+                # Click 'Annuler cette candidature'
                 cancel_btn = target_block.find_element(By.CSS_SELECTOR, "a.tool-link.hi-cross-round")
                 driver.execute_script("arguments[0].scrollIntoView({block:'center'});", cancel_btn)
                 cancel_btn.click()
                 
+                # Confirm Cancel (Popin 2, button Oui)
+                # HTML: <button class="btn btn-13 btn-outline-primary"> Oui </button>
                 confirm = WebDriverWait(driver, 5).until(
-                    EC.element_to_be_clickable((By.XPATH, "//button[contains(.,'OK') or contains(.,'Confirmer')]"))
+                    EC.element_to_be_clickable((By.CSS_SELECTOR, "button.btn.btn-13.btn-outline-primary"))
                 )
                 confirm.click()
                 logging.info("IMMEDIATE CANCELLATION SUCCESSFUL.")
@@ -400,14 +409,14 @@ def verify_and_cancel_new_application(driver, wait, account, offer_uid):
             except Exception as e:
                 logging.error(f"Failed to auto-cancel: {e}")
         else:
-            logging.info(f"Rank {rank} is good (<= 10). Keeping candidature.")
+            logging.info(f"Rank {rank} is good (<= 10).")
             send_email(f"BOTALIN - SUCCESS ({account['name']})", f"Nouvelle candidature confirmee.\nRang: {rank}")
 
     except Exception as e:
         logging.error(f"Error checking rank: {e}")
 
 
-# ---------- MAIN ----------
+# ---------- MAIN PROCESS ----------
 
 def process_account(account):
     email = os.environ.get(account["email_env"])
@@ -420,8 +429,7 @@ def process_account(account):
     logging.info(f"--- Starting {account['name']} ---")
     
     driver = init_driver()
-    driver.delete_all_cookies() # IMPORTANT: Clean session from previous account
-    
+    driver.delete_all_cookies()
     wait = WebDriverWait(driver, WAIT_TIMEOUT)
     seen = set(load_json(account["seen_file"], []))
     
@@ -429,21 +437,18 @@ def process_account(account):
         if not ensure_logged_in(driver, wait, email, password):
             return
         
-        # LOGIC CHANGE: Do NOT check existing candidatures ("tu ne fais rien du tout")
-        
         # Force Navigation to Search to find NEW offers
         if "recherche-logement" not in driver.current_url:
             logging.info("Navigating to Search page...")
             driver.get("https://al-in.fr/#/recherche-logement")
-            # Wait for container to be safe
             try:
-                WebDriverWait(driver, 10).until(EC.presence_of_element_located((By.CSS_SELECTOR, ".offer-list-container")))
+                # Wait briefly for container, if slow, proceed anyway
+                WebDriverWait(driver, 8).until(EC.presence_of_element_located((By.CSS_SELECTOR, ".offer-list-container")))
             except: pass
 
         found_match = False
         target_offer = None
         
-        # Search loop
         for section_name in account["section_scope"]:
             btn = find_section_button(driver, section_name)
             if not btn: continue
@@ -455,7 +460,7 @@ def process_account(account):
             
             try:
                 container = driver.find_element(By.CSS_SELECTOR, ".offer-list-container")
-                progressive_scroll_container_to_bottom(driver, container, max_attempts=5)
+                progressive_scroll_container_to_bottom(driver, container, max_attempts=4)
             except: pass
 
             cards = driver.find_elements(By.CSS_SELECTOR, "app-offer-card")
@@ -464,7 +469,7 @@ def process_account(account):
                 if not info or not info["uid"]: continue
                 if info["uid"] in seen: continue
                 
-                # Check criteria
+                # Criteria
                 if info["price"] and info["price"] > account["max_price"]: continue
                 if info["area"] and account["min_area"] > 0 and info["area"] < account["min_area"]: continue
                 if not re.search(account["wanted_typ"], info["typ"] or "", re.IGNORECASE): continue
@@ -475,7 +480,6 @@ def process_account(account):
             
             if found_match: break
         
-        # Apply Logic
         if found_match and target_offer:
             card_elem, info = target_offer
             logging.info(f"Applying to: {info}")
@@ -488,18 +492,19 @@ def process_account(account):
             
             success, reason = apply_to_offer(driver, wait)
             
-            # Mark seen
             seen.add(info["uid"])
             save_json(account["seen_file"], list(seen))
             
             if success:
-                # NEW LOGIC: Check rank immediately after apply
-                verify_and_cancel_new_application(driver, wait, account, info["uid"])
+                verify_and_cancel_new_application(driver, wait, account)
             else:
                 logging.error(f"Failed apply: {reason}")
         
         else:
             logging.info("No new matching offers found.")
+        
+        # LOGOUT AT THE END
+        perform_logout(driver, wait)
 
     except Exception as e:
         logging.error(f"Global error for {account['name']}: {e}")
