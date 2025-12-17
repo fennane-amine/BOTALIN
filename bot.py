@@ -1,5 +1,5 @@
-# bot.py - watcher + apply + candidature status tracking + email notifications for 2 accounts
-# IMPORTANT: Put real credentials into environment variables, NOT in the code.
+# bot.py - watcher + apply + ranking check + email notifications
+# IMPORTANT: Put real credentials into environment variables.
 
 import os
 import time
@@ -30,8 +30,8 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(
 # ---------- GLOBAL CONFIG ----------
 BASE_URL = "https://al-in.fr/#/connexion-demandeur"
 
-# Increased timeouts for stability
-WAIT_TIMEOUT = int(os.environ.get("WAIT_TIMEOUT", "20"))
+# Reduced timeouts for speed. The site is slow, but waiting 30s blocks the bot too long.
+WAIT_TIMEOUT = int(os.environ.get("WAIT_TIMEOUT", "15"))
 HEADLESS = os.environ.get("HEADLESS", "true").lower() in ("1", "true", "yes")
 MAX_RUN_SECONDS = int(os.environ.get("MAX_RUN_SECONDS", "300"))
 
@@ -49,7 +49,8 @@ ACCOUNTS = [
         "max_price": 800,
         "min_area": 45,
         "wanted_typ": "T2",
-        "section_scope": ["Communes demandées"],
+        # UPDATED: Checks Demandées THEN Limitrophes
+        "section_scope": ["Communes demandées", "Communes limitrophes"],
         "seen_file": "offers_seen_account1.json",
         "cand_file": "candidatures_status_account1.json",
     },
@@ -60,6 +61,7 @@ ACCOUNTS = [
         "max_price": 900,
         "min_area": 0,
         "wanted_typ": "T4|T5",
+        # UPDATED: Only Demandées
         "section_scope": ["Communes demandées"],
         "seen_file": "offers_seen_account2.json",
         "cand_file": "candidatures_status_account2.json",
@@ -67,30 +69,27 @@ ACCOUNTS = [
 ]
 
 # ---------- GENERAL SETTINGS ----------
-CLICK_RETRIES = int(os.environ.get("CLICK_RETRIES", "5"))
-SCROLL_PAUSE = float(os.environ.get("SCROLL_PAUSE", "0.8"))
-CONTAINER_SCROLL_ATTEMPTS = int(os.environ.get("CONTAINER_SCROLL_ATTEMPTS", "20"))
+CLICK_RETRIES = 3
+SCROLL_PAUSE = 0.5
+CONTAINER_SCROLL_ATTEMPTS = 10
 
-# ---------- HELPERS: file / parsing / email ----------
+# ---------- HELPERS ----------
 
 def send_email(subject: str, body: str) -> bool:
-    """Send notification email via Gmail TLS."""
     if not SENDER_EMAIL or not SENDER_PASS or not RECIPIENT_EMAIL:
-        logging.warning("SMTP not configured (check secrets): skip send_email.")
+        logging.warning("SMTP not configured: skip send_email.")
         return False
     msg = EmailMessage()
     msg["From"] = SENDER_EMAIL
     msg["To"] = RECIPIENT_EMAIL
     msg["Subject"] = subject
     msg.set_content(body)
-    
     try:
-        with smtplib.SMTP("smtp.gmail.com", 587, timeout=20) as s:
+        with smtplib.SMTP("smtp.gmail.com", 587, timeout=15) as s:
             s.ehlo()
             s.starttls()
             s.login(SENDER_EMAIL, SENDER_PASS)
             s.send_message(msg)
-        logging.info(f"Notification email sent to recipients.")
         return True
     except Exception as e:
         logging.warning(f"SMTP send failed: {e}")
@@ -107,41 +106,33 @@ def save_json(path, data):
     try:
         with open(path, "w", encoding="utf-8") as f:
             json.dump(data, f, ensure_ascii=False, indent=2)
-    except Exception as e:
-        logging.warning(f"Failed to save {path}: {e}")
+    except Exception:
+        pass
 
 def parse_price(price_text: str):
-    if not price_text:
-        return None
+    if not price_text: return None
     cleaned = price_text.replace("\u00A0", " ").strip()
     m = re.search(r"^(\d+(?:[ ]\d+)*)", cleaned)
     if m:
-        try:
-            return int(m.group(1).replace(" ", ""))
-        except:
-            pass
+        try: return int(m.group(1).replace(" ", ""))
+        except: pass
     return None
 
 def parse_area_from_typology(typ_text: str):
-    if not typ_text:
-        return None
+    if not typ_text: return None
     cleaned = typ_text.replace("\u00A0", " ").replace(",", ".")
     m = re.search(r"(\d+(?:\.\d+)?)\s*m", cleaned, re.IGNORECASE)
     if m:
-        try:
-            return float(m.group(1))
-        except:
-            pass
+        try: return float(m.group(1))
+        except: pass
     return None
 
-# ---------- UI helpers ----------
+# ---------- UI HELPERS ----------
 
-def handle_cookie_banner(driver, timeout=5):
-    # Updated selectors based on provided HTML
+def handle_cookie_banner(driver, timeout=3):
     selectors = [
         "button[data-cookiefirst-action='accept']",
         "//button[contains(., 'Accepter tous les cookies')]",
-        "//button[contains(@class, 'cf2Lf6') and contains(., 'Accepter')]",
     ]
     for s in selectors:
         try:
@@ -149,15 +140,10 @@ def handle_cookie_banner(driver, timeout=5):
                 el = WebDriverWait(driver, timeout).until(EC.element_to_be_clickable((By.XPATH, s)))
             else:
                 el = WebDriverWait(driver, timeout).until(EC.element_to_be_clickable((By.CSS_SELECTOR, s)))
-            
-            # Click
-            try:
-                el.click()
-            except:
-                driver.execute_script("arguments[0].click();", el)
-            
+            try: el.click()
+            except: driver.execute_script("arguments[0].click();", el)
             logging.info("✅ Bannière cookies acceptée.")
-            time.sleep(1.0) # Wait for banner to disappear
+            time.sleep(0.5)
             return True
         except Exception:
             continue
@@ -169,11 +155,10 @@ def close_overlays(driver):
         for ov in overlays:
             if ov.is_displayed():
                 driver.execute_script("arguments[0].click();", ov)
-                time.sleep(0.2)
     except:
         pass
 
-def progressive_scroll_container_to_bottom(driver, container, max_attempts=CONTAINER_SCROLL_ATTEMPTS, pause=SCROLL_PAUSE):
+def progressive_scroll_container_to_bottom(driver, container, max_attempts=10, pause=0.4):
     try:
         last_height = driver.execute_script("return arguments[0].scrollHeight", container)
         for _ in range(max_attempts):
@@ -183,10 +168,10 @@ def progressive_scroll_container_to_bottom(driver, container, max_attempts=CONTA
             if new_height == last_height:
                 break
             last_height = new_height
-    except Exception:
+    except:
         pass
 
-# ---------- Selenium driver init ----------
+# ---------- DRIVER ----------
 
 def init_driver():
     options = Options()
@@ -196,26 +181,34 @@ def init_driver():
     options.add_argument("--disable-dev-shm-usage")
     options.add_argument("--window-size=1920,1080")
     options.add_argument("--disable-gpu")
+    # Speed optimization: Eager strategy (DOMContentLoaded) instead of full Load
+    options.page_load_strategy = 'eager'
     options.add_argument(f"--user-data-dir=/tmp/chrome_user_data_{os.getpid()}")
 
     try:
         driver = webdriver.Chrome(options=options)
-        return driver
-    except Exception:
+    except:
         driver_path = ChromeDriverManager().install()
         try:
             st = os.stat(driver_path)
             os.chmod(driver_path, st.st_mode | 0o111)
-        except:
-            pass
+        except: pass
         service = Service(driver_path)
         driver = webdriver.Chrome(service=service, options=options)
-        return driver
+    
+    # Global timeout for script execution to prevent hanging
+    driver.set_page_load_timeout(40)
+    return driver
 
-# ---------- Login flow (Updated) ----------
+# ---------- LOGIN ----------
 
 def perform_login(driver, wait, email, password):
-    driver.get(BASE_URL)
+    try:
+        driver.get(BASE_URL)
+    except TimeoutException:
+        logging.warning("Page load timeout on login page, stopping loading and trying to find form.")
+        driver.execute_script("window.stop();")
+
     handle_cookie_banner(driver, timeout=3)
     
     try:
@@ -229,59 +222,50 @@ def perform_login(driver, wait, email, password):
         pwd_input.clear()
         pwd_input.send_keys(password)
         
-        # Click login
         btn = wait.until(EC.element_to_be_clickable((By.CSS_SELECTOR, "button.btnCreate")))
         driver.execute_script("arguments[0].scrollIntoView(true);", btn)
-        time.sleep(0.8)
+        time.sleep(0.5)
         
         try:
             btn.click()
         except:
             driver.execute_script("arguments[0].click();", btn)
             
-        logging.info("Clicked login button. Waiting for dashboard or candidature page...")
+        logging.info("Clicked login. Waiting for next page...")
 
-        # Wait longer for dashboard or candidature page
-        WebDriverWait(driver, 30).until(EC.any_of(
-             EC.presence_of_element_located((By.CSS_SELECTOR, ".offer-sections")),      # Offres
-             EC.presence_of_element_located((By.CSS_SELECTOR, ".tdb-s-candidature")),  # Candidatures (redirected here)
-             EC.presence_of_element_located((By.CSS_SELECTOR, "app-list-housing-offers")),
+        # Wait for either Search Dashboard OR Candidatures page
+        WebDriverWait(driver, 20).until(EC.any_of(
+             EC.presence_of_element_located((By.CSS_SELECTOR, ".offer-sections")),
+             EC.presence_of_element_located((By.CSS_SELECTOR, ".tdb-s-candidature")),
              EC.url_contains("offre"),
-             EC.url_contains("candidatures")
+             EC.url_contains("candidature")
         ))
         
-        logging.info("Login successful (Dashboard or Candidature page detected).")
-        handle_cookie_banner(driver, timeout=1) 
+        logging.info("Login successful.")
+        handle_cookie_banner(driver, timeout=1)
         close_overlays(driver)
         return True
 
     except Exception as e:
         logging.error(f"Login failed: {e}")
-        try:
-            driver.save_screenshot("login_error.png")
-        except:
-            pass
         return False
 
 def ensure_logged_in(driver, wait, email, password):
-    # Check if we are already on a logged-in page
+    # Quick check
     try:
-        if len(driver.find_elements(By.CSS_SELECTOR, ".offer-sections")) > 0:
-            return True
-        if len(driver.find_elements(By.CSS_SELECTOR, ".tdb-s-candidature")) > 0:
-            return True
-    except:
-        pass
+        if len(driver.find_elements(By.CSS_SELECTOR, ".offer-sections")) > 0: return True
+        if "candidature" in driver.current_url: return True
+    except: pass
     
-    logging.info("Not logged in or session expired. Logging in...")
+    logging.info("Not logged in. Logging in...")
     return perform_login(driver, wait, email, password)
 
-# ---------- Offers Parsing ----------
+# ---------- OFFERS ----------
 
 def find_section_button(driver, name):
     xpath = f"//div[contains(@class,'section') and contains(., '{name}')]"
     try:
-        return WebDriverWait(driver, 5).until(EC.element_to_be_clickable((By.XPATH, xpath)))
+        return WebDriverWait(driver, 3).until(EC.element_to_be_clickable((By.XPATH, xpath)))
     except TimeoutException:
         return None
 
@@ -291,28 +275,24 @@ def extract_offer_from_card(card):
         try:
             img_el = card.find_element(By.CSS_SELECTOR, ".offer-image img")
             info["img_src"] = img_el.get_attribute("src")
-        except:
-            pass
+        except: pass
         
         try:
             price_el = card.find_element(By.CSS_SELECTOR, ".price")
             info["raw_price"] = price_el.text.strip()
             info["price"] = parse_price(info["raw_price"])
-        except:
-            pass
+        except: pass
             
         try:
             typ_el = card.find_element(By.CSS_SELECTOR, ".typology")
             info["typ"] = typ_el.text.strip()
             info["area"] = parse_area_from_typology(info["typ"])
-        except:
-            pass
+        except: pass
             
         try:
             loc_el = card.find_element(By.CSS_SELECTOR, ".location")
             info["loc"] = loc_el.text.strip()
-        except:
-            pass
+        except: pass
         
         if info["img_src"] and "assets/img" not in info["img_src"]:
             info["uid"] = info["img_src"]
@@ -321,129 +301,113 @@ def extract_offer_from_card(card):
             
     except StaleElementReferenceException:
         return None
-        
     return info
 
-# ---------- Apply Flow ----------
+# ---------- ACTIONS ----------
 
 def apply_to_offer(driver, wait):
-    # 1. Je postule
+    # Click "Je postule"
     try:
         apply_btn = wait.until(EC.element_to_be_clickable((By.CSS_SELECTOR, "button.btn.btn-secondary.hi-check-round")))
         driver.execute_script("arguments[0].scrollIntoView({block:'center'});", apply_btn)
-        time.sleep(0.5)
+        time.sleep(0.3)
         apply_btn.click()
         logging.info("Clicked 'Je postule'")
     except Exception as e:
         logging.error(f"Failed to click 'Je postule': {e}")
         return False, "btn_not_found"
 
-    # 2. Confirmer
+    # Confirm
     try:
         confirm_btn = WebDriverWait(driver, 5).until(
             EC.element_to_be_clickable((By.XPATH, "//button[contains(@class,'btn-13') and contains(.,'Confirmer')]"))
         )
-        time.sleep(0.5)
+        time.sleep(0.3)
         confirm_btn.click()
         logging.info("Clicked 'Confirmer'")
-    except Exception as e:
-        logging.error(f"Failed to confirm application: {e}")
+    except Exception:
         return False, "confirm_failed"
 
-    # 3. Ok
+    # Ok
     try:
-        ok_btn = WebDriverWait(driver, 8).until(
+        ok_btn = WebDriverWait(driver, 5).until(
             EC.element_to_be_clickable((By.XPATH, "//button[contains(@class,'btn-13') and contains(.,'Ok')]"))
         )
-        time.sleep(0.5)
+        time.sleep(0.3)
         ok_btn.click()
-        logging.info("Clicked 'Ok' (Success)")
+        logging.info("Clicked 'Ok'")
         return True, "applied"
     except Exception:
-        logging.warning("Success 'Ok' button not found, assuming applied.")
+        logging.warning("'Ok' button missed, assuming success.")
         return True, "applied_no_ok"
 
-# ---------- Candidature Status ----------
-
-def check_and_cancel_candidatures(driver, wait, account):
-    candidatures = load_json(account["cand_file"], {})
-    
-    # Try to go to candidatures if not there
+def verify_and_cancel_new_application(driver, wait, account, offer_uid):
+    """
+    Called IMMEDIATELY after applying to an offer.
+    Goes to 'Mes candidatures', finds the latest one, checks rank.
+    If rank > 10, cancels it.
+    """
+    logging.info("Verifying rank of new application...")
     try:
         if "mes-candidatures" not in driver.current_url:
             driver.get("https://al-in.fr/#/mes-candidatures")
         
-        # Fast wait
         WebDriverWait(driver, 10).until(EC.presence_of_element_located((By.CSS_SELECTOR, ".tdb-s-candidature")))
-        time.sleep(2)
+        time.sleep(1.5) # Let animation finish
     except:
-        logging.info("No active candidatures found or page load failed.")
+        logging.error("Could not load candidatures page to verify rank.")
         return
 
+    # Find the matching block (the one we just added should be at the top or match the UID/Title)
     blocks = driver.find_elements(By.CSS_SELECTOR, ".tdb-s-candidature")
-    logging.info(f"Checking {len(blocks)} active candidatures...")
+    target_block = None
     
-    for block in blocks:
+    # Heuristic: First block is usually the newest. 
+    # But better to check matches if possible, though UID is hard to match here.
+    # We will assume the first block is the one we just processed.
+    if blocks:
+        target_block = blocks[0]
+        
+    if not target_block:
+        logging.warning("No candidature blocks found.")
+        return
+
+    try:
+        # Check Rank
+        rank = 999
         try:
+            txt = target_block.text
+            m = re.search(r"Position\s*(\d+)", txt, re.IGNORECASE)
+            if m:
+                rank = int(m.group(1))
+        except: pass
+        
+        logging.info(f"New Application Rank detected: {rank}")
+
+        if rank > 10:
+            logging.warning(f"Rank {rank} > 10. Cancelling immediately.")
             try:
-                title_el = block.find_element(By.CSS_SELECTOR, ".title")
-                title_text = title_el.text.strip()
-            except:
-                title_text = "Unknown"
+                cancel_btn = target_block.find_element(By.CSS_SELECTOR, "a.tool-link.hi-cross-round")
+                driver.execute_script("arguments[0].scrollIntoView({block:'center'});", cancel_btn)
+                cancel_btn.click()
+                
+                confirm = WebDriverWait(driver, 5).until(
+                    EC.element_to_be_clickable((By.XPATH, "//button[contains(.,'OK') or contains(.,'Confirmer')]"))
+                )
+                confirm.click()
+                logging.info("IMMEDIATE CANCELLATION SUCCESSFUL.")
+                send_email(f"BOTALIN - AUTO CANCEL ({account['name']})", f"Candidature annulee car rang {rank} > 10.")
+            except Exception as e:
+                logging.error(f"Failed to auto-cancel: {e}")
+        else:
+            logging.info(f"Rank {rank} is good (<= 10). Keeping candidature.")
+            send_email(f"BOTALIN - SUCCESS ({account['name']})", f"Nouvelle candidature confirmee.\nRang: {rank}")
 
-            uid_key = title_text 
-            rank = 999 
-            
-            try:
-                full_text = block.text
-                m_pos = re.search(r"Position\s*(\d+)", full_text, re.IGNORECASE)
-                if m_pos:
-                    rank = int(m_pos.group(1))
-            except:
-                pass
+    except Exception as e:
+        logging.error(f"Error checking rank: {e}")
 
-            status = "Inconnu"
-            try:
-                status_block = block.find_element(By.XPATH, ".//*[contains(text(),'Statut de la demande')]/following-sibling::div/span")
-                status = status_block.text.strip()
-            except:
-                pass
-            
-            # Cancel rule: Rank > 10
-            if rank > 10 and rank != 999:
-                logging.info(f"Cancelling: {title_text} (Rank {rank} > 10)")
-                try:
-                    cancel_btn = block.find_element(By.CSS_SELECTOR, "a.tool-link.hi-cross-round")
-                    driver.execute_script("arguments[0].scrollIntoView({block:'center'});", cancel_btn)
-                    cancel_btn.click()
-                    
-                    confirm_cancel = WebDriverWait(driver, 5).until(
-                        EC.element_to_be_clickable((By.XPATH, "//button[contains(.,'OK') or contains(.,'Confirmer')]"))
-                    )
-                    confirm_cancel.click()
-                    logging.info("Cancellation confirmed.")
-                    status = "Annulée"
-                except Exception as e:
-                    logging.error(f"Failed to cancel: {e}")
 
-            old_data = candidatures.get(uid_key, {})
-            if old_data.get("status") != status:
-                send_email(f"BOTALIN Update ({account['name']})", f"Offre: {title_text}\nNouveau statut: {status}\nRang détecté: {rank}")
-            
-            candidatures[uid_key] = {
-                "status": status,
-                "rank": rank,
-                "last_check": datetime.now().isoformat()
-            }
-
-        except StaleElementReferenceException:
-            continue
-        except Exception as e:
-            logging.error(f"Error parsing candidature block: {e}")
-
-    save_json(account["cand_file"], candidatures)
-
-# ---------- MAIN PROCESS ----------
+# ---------- MAIN ----------
 
 def process_account(account):
     email = os.environ.get(account["email_env"])
@@ -454,66 +418,64 @@ def process_account(account):
         return
 
     logging.info(f"--- Starting {account['name']} ---")
-    seen = set(load_json(account["seen_file"], []))
     
     driver = init_driver()
+    driver.delete_all_cookies() # IMPORTANT: Clean session from previous account
+    
     wait = WebDriverWait(driver, WAIT_TIMEOUT)
+    seen = set(load_json(account["seen_file"], []))
     
     try:
         if not ensure_logged_in(driver, wait, email, password):
-            driver.save_screenshot(f"login_fail_{account['name']}.png")
             return
         
-        # 1. First, check status of existing candidatures (since we might be redirected there)
-        check_and_cancel_candidatures(driver, wait, account)
-
-        # 2. Force Navigation to Search to find NEW offers
+        # LOGIC CHANGE: Do NOT check existing candidatures ("tu ne fais rien du tout")
+        
+        # Force Navigation to Search to find NEW offers
         if "recherche-logement" not in driver.current_url:
             logging.info("Navigating to Search page...")
             driver.get("https://al-in.fr/#/recherche-logement")
-            time.sleep(3)
+            # Wait for container to be safe
+            try:
+                WebDriverWait(driver, 10).until(EC.presence_of_element_located((By.CSS_SELECTOR, ".offer-list-container")))
+            except: pass
 
         found_match = False
         target_offer = None
         
+        # Search loop
         for section_name in account["section_scope"]:
             btn = find_section_button(driver, section_name)
-            if not btn:
-                continue
+            if not btn: continue
             
             try:
                 driver.execute_script("arguments[0].click();", btn)
-                time.sleep(1.5)
-            except:
-                pass
+                time.sleep(1.0)
+            except: pass
             
             try:
                 container = driver.find_element(By.CSS_SELECTOR, ".offer-list-container")
                 progressive_scroll_container_to_bottom(driver, container, max_attempts=5)
-            except:
-                pass
+            except: pass
 
             cards = driver.find_elements(By.CSS_SELECTOR, "app-offer-card")
             for card in cards:
                 info = extract_offer_from_card(card)
                 if not info or not info["uid"]: continue
+                if info["uid"] in seen: continue
                 
-                if info["uid"] in seen:
-                    continue
-                
+                # Check criteria
                 if info["price"] and info["price"] > account["max_price"]: continue
                 if info["area"] and account["min_area"] > 0 and info["area"] < account["min_area"]: continue
-                
-                if not re.search(account["wanted_typ"], info["typ"] or "", re.IGNORECASE):
-                    continue
+                if not re.search(account["wanted_typ"], info["typ"] or "", re.IGNORECASE): continue
                 
                 target_offer = (card, info)
                 found_match = True
                 break
             
-            if found_match:
-                break
+            if found_match: break
         
+        # Apply Logic
         if found_match and target_offer:
             card_elem, info = target_offer
             logging.info(f"Applying to: {info}")
@@ -526,11 +488,13 @@ def process_account(account):
             
             success, reason = apply_to_offer(driver, wait)
             
+            # Mark seen
             seen.add(info["uid"])
             save_json(account["seen_file"], list(seen))
             
             if success:
-                send_email(f"BOTALIN APPLIED ({account['name']})", f"Applied to {info}")
+                # NEW LOGIC: Check rank immediately after apply
+                verify_and_cancel_new_application(driver, wait, account, info["uid"])
             else:
                 logging.error(f"Failed apply: {reason}")
         
@@ -539,15 +503,9 @@ def process_account(account):
 
     except Exception as e:
         logging.error(f"Global error for {account['name']}: {e}")
-        try:
-            driver.save_screenshot(f"error_{account['name']}.png")
-        except:
-            pass
     finally:
-        try:
-            driver.quit()
-        except:
-            pass
+        try: driver.quit()
+        except: pass
 
 def main():
     for account in ACCOUNTS:
