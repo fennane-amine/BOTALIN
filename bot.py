@@ -43,28 +43,27 @@ RECIPIENT_EMAIL = os.environ.get("RECIPIENT_EMAIL", "fennane.mohamedamine@gmail.
 ACCOUNTS = [
     {
         "name": "account1",
-        "email_env": "mohamed-amine.fennane@epita.fr",
-        "pass_env": "&9.Mnq.6F8'M/wm{",
-        "max_price": 800,                           # Max 800€
-        "min_area": 45,                             # Min 45m2
-        "wanted_typ": "T2",                         # T2 only
-        "section_scope": ["Communes demandées"],    # Only Communes demandées
+        "email_env": "EMAIL_1",       # Nom de la variable d'environnement pour l'email
+        "pass_env": "PASSWORD_1",     # Nom de la variable d'environnement pour le mdp
+        "max_price": 800,
+        "min_area": 45,
+        "wanted_typ": "T2",
+        "section_scope": ["Communes demandées"],
         "seen_file": "offers_seen_account1.json",
         "cand_file": "candidatures_status_account1.json",
     },
     {
         "name": "account2",
-        "email_env": "abdelhakim.fennane@sncf.fr",
-        "pass_env": "Youssef2017*@",
-        "max_price": 900,                           # Max 900€
-        "min_area": 0,                              # No specific min area
-        "wanted_typ": "T4|T5",                      # T4 or T5
-        "section_scope": ["Communes demandées"],    # Only Communes demandées
+        "email_env": "EMAIL_2",       # Nom de la variable d'environnement pour l'email
+        "pass_env": "PASSWORD_2",     # Nom de la variable d'environnement pour le mdp
+        "max_price": 900,
+        "min_area": 0,
+        "wanted_typ": "T4|T5",
+        "section_scope": ["Communes demandées"],
         "seen_file": "offers_seen_account2.json",
         "cand_file": "candidatures_status_account2.json",
     }
 ]
-
 # ---------- GENERAL SETTINGS ----------
 CLICK_RETRIES = int(os.environ.get("CLICK_RETRIES", "5"))
 SCROLL_PAUSE = float(os.environ.get("SCROLL_PAUSE", "0.6"))
