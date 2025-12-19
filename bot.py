@@ -16,6 +16,8 @@ from selenium.webdriver.chrome.options import Options
 from selenium.webdriver.chrome.service import Service
 from selenium.common.exceptions import (
     TimeoutException,
+    ElementClickInterceptedException,
+    NoSuchElementException,
     StaleElementReferenceException
 )
 from selenium.webdriver.support.ui import WebDriverWait
@@ -28,6 +30,7 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(
 # ---------- GLOBAL CONFIG ----------
 BASE_URL = "https://al-in.fr/#/connexion-demandeur"
 
+# Timers optimized
 WAIT_TIMEOUT = int(os.environ.get("WAIT_TIMEOUT", "25"))
 HEADLESS = os.environ.get("HEADLESS", "true").lower() in ("1", "true", "yes")
 MAX_RUN_SECONDS = int(os.environ.get("MAX_RUN_SECONDS", "300"))
@@ -43,13 +46,13 @@ ACCOUNTS = [
         "name": "account1",
         "email_env": "EMAIL_1",
         "pass_env": "PASSWORD_1",
-        "min_price": 650,    # UPDATED: 650€
-        "max_price": 900,    # UPDATED: 900€
+        "min_price": 650,    
+        "max_price": 900,    
         "min_area": 45,
         "wanted_typ": "T2",
         "section_scope": ["Communes demandées", "Communes limitrophes"],
-        # Special filter: In limitrophes, accept ONLY specific cities
-        "limitrophes_filter": ["PARIS", "BOULOGNE"], 
+        # UPDATED: Limitrophes filter removed (searches everything)
+        "limitrophes_filter": [], 
         "seen_file": "offers_seen_account1.json",
         "cand_file": "candidatures_status_account1.json",
     },
@@ -62,7 +65,7 @@ ACCOUNTS = [
         "min_area": 0,
         "wanted_typ": "T4|T5",
         "section_scope": ["Communes demandées"],
-        "limitrophes_filter": [], # No specific filter
+        "limitrophes_filter": [], 
         "seen_file": "offers_seen_account2.json",
         "cand_file": "candidatures_status_account2.json",
     }
@@ -84,7 +87,6 @@ def send_email(subject: str, body: str) -> bool:
             s.starttls()
             s.login(SENDER_EMAIL, SENDER_PASS)
             s.send_message(msg)
-        logging.info("Email sent successfully.")
         return True
     except Exception as e:
         logging.warning(f"SMTP send failed: {e}")
@@ -137,6 +139,7 @@ def handle_cookie_banner(driver, timeout=3):
                 el = WebDriverWait(driver, timeout).until(EC.element_to_be_clickable((By.CSS_SELECTOR, s)))
             try: el.click()
             except: driver.execute_script("arguments[0].click();", el)
+            logging.info("✅ Bannière cookies acceptée.")
             time.sleep(0.5)
             return True
         except Exception:
@@ -238,7 +241,6 @@ def perform_login(driver, wait, email, password):
 
     except Exception as e:
         logging.error(f"Login failed: {e}")
-        # EMAIL ON LOGIN CRASH
         send_email(f"BOTALIN CRASH - Login Failed", f"Le login a échoué pour le compte {email}.\nErreur: {e}")
         return False
 
@@ -254,17 +256,21 @@ def ensure_logged_in(driver, wait, email, password):
 def perform_logout(driver, wait):
     logging.info("Logging out...")
     try:
+        # 1. SCROLL TO TOP
         driver.execute_script("window.scrollTo(0, 0);")
         time.sleep(1.0) 
         close_overlays(driver)
         
+        # 2. Click "Mon compte"
         mon_compte_btn = wait.until(EC.presence_of_element_located((By.CSS_SELECTOR, "a.lessor-nav-trigger")))
         driver.execute_script("arguments[0].click();", mon_compte_btn)
         time.sleep(1.0) 
 
+        # 3. Click "Deconnexion"
         logout_btn = wait.until(EC.element_to_be_clickable((By.XPATH, "//a[contains(.,'Déconnexion')]")))
         driver.execute_script("arguments[0].click();", logout_btn)
         
+        # 4. Wait for login form
         WebDriverWait(driver, 10).until(EC.presence_of_element_located((By.CSS_SELECTOR, "form.global-form")))
         logging.info("Logout successful.")
         return True
@@ -275,10 +281,6 @@ def perform_logout(driver, wait):
 # ---------- MONITORING (STATUS CHECK) ----------
 
 def track_status_changes(driver, wait, account):
-    """
-    Scans 'Mes candidatures' to detect status changes on EXISTING applications.
-    Does NOT cancel anything here. Just monitoring.
-    """
     logging.info("Checking for status changes...")
     candidatures = load_json(account["cand_file"], {})
     
@@ -303,7 +305,6 @@ def track_status_changes(driver, wait, account):
                 title_text = "Offre Inconnue"
 
             # Extract Status
-            # Example text: "Statut de la demande \n En attente"
             status = "Inconnu"
             try:
                 status_block = block.find_element(By.XPATH, ".//*[contains(text(),'Statut de la demande')]/following-sibling::div/span")
@@ -312,12 +313,11 @@ def track_status_changes(driver, wait, account):
                 pass
 
             # Detect change
-            # Use title as key
             uid_key = title_text
             old_data = candidatures.get(uid_key, {})
             old_status = old_data.get("status")
 
-            if old_status and status != old_status:
+            if old_status and status and status != old_status:
                 logging.info(f"Status changed for {uid_key}: {old_status} -> {status}")
                 # SEND EMAIL ON STATUS CHANGE
                 body = f"""
@@ -326,12 +326,9 @@ def track_status_changes(driver, wait, account):
                 
                 ANCIEN STATUT : {old_status}
                 NOUVEAU STATUT : {status}
-                
-                Veuillez vous connecter pour vérifier.
                 """
                 send_email(f"BOTALIN - CHANGEMENT STATUT ({status})", body)
 
-            # Update file
             candidatures[uid_key] = {
                 "status": status,
                 "last_check": datetime.now().isoformat()
@@ -457,30 +454,23 @@ def verify_and_cancel_new_application(driver, wait, account):
         
         logging.info(f"New Application Rank detected: {rank}")
 
-        # LOGIC: Cancel if Rank > 10 (and not 999)
         if 10 < rank < 999:
             logging.warning(f"Rank {rank} > 10. Cancelling immediately.")
             try:
                 cancel_btn = target_block.find_element(By.CSS_SELECTOR, "a.tool-link.hi-cross-round")
                 driver.execute_script("arguments[0].scrollIntoView({block:'center'});", cancel_btn)
                 cancel_btn.click()
-                
                 confirm = WebDriverWait(driver, 5).until(
                     EC.element_to_be_clickable((By.CSS_SELECTOR, "button.btn.btn-13.btn-outline-primary"))
                 )
                 confirm.click()
                 logging.info("IMMEDIATE CANCELLATION SUCCESSFUL.")
-                # NO EMAIL FOR CANCELLATION AS REQUESTED
+                # NO EMAIL ON AUTO CANCEL
             except Exception as e:
                 logging.error(f"Failed to auto-cancel: {e}")
-                
         elif rank == 999:
             logging.warning("Rank could not be parsed (999). Keeping candidature.")
-            # Optional: Send email for debug if rank is weird?
-            # User said "detail email only when rank <= 10", so we skip email here too unless safe.
-            
         else:
-            # RANK <= 10: SUCCESS EMAIL
             logging.info(f"Rank {rank} is good (<= 10).")
             body = f"""
             FÉLICITATIONS ! Candidature confirmée et bien placée.
@@ -488,131 +478,7 @@ def verify_and_cancel_new_application(driver, wait, account):
             Compte: {account['name']}
             Offre: {title_text}
             RANG DÉTECTÉ: {rank}
-            
-            Action: Aucune (Candidature conservée)
             """
             send_email(f"BOTALIN - TOP CANDIDATURE (Rang {rank})", body)
 
     except Exception as e:
-        logging.error(f"Error checking rank: {e}")
-
-
-# ---------- MAIN PROCESS ----------
-
-def process_account(account):
-    email = os.environ.get(account["email_env"])
-    password = os.environ.get(account["pass_env"])
-    
-    if not email or not password:
-        logging.error(f"Skipping {account['name']}: Missing credentials.")
-        return
-
-    logging.info(f"--- Starting {account['name']} ---")
-    
-    driver = init_driver()
-    driver.delete_all_cookies()
-    wait = WebDriverWait(driver, WAIT_TIMEOUT)
-    seen = set(load_json(account["seen_file"], []))
-    
-    try:
-        if not ensure_logged_in(driver, wait, email, password):
-            return
-        
-        # 1. MONITORING: Check for status changes on OLD apps
-        track_status_changes(driver, wait, account)
-        
-        # 2. SEARCH: Go to search page
-        if "recherche-logement" not in driver.current_url:
-            logging.info("Navigating to Search page...")
-            driver.get("https://al-in.fr/#/recherche-logement")
-            try:
-                WebDriverWait(driver, 8).until(EC.presence_of_element_located((By.CSS_SELECTOR, ".offer-list-container")))
-            except: pass
-
-        found_match = False
-        target_offer = None
-        
-        for section_name in account["section_scope"]:
-            btn = find_section_button(driver, section_name)
-            if not btn: continue
-            
-            try:
-                driver.execute_script("arguments[0].click();", btn)
-                time.sleep(1.0)
-            except: pass
-            
-            try:
-                container = driver.find_element(By.CSS_SELECTOR, ".offer-list-container")
-                progressive_scroll_container_to_bottom(driver, container, max_attempts=4)
-            except: pass
-
-            cards = driver.find_elements(By.CSS_SELECTOR, "app-offer-card")
-            for card in cards:
-                info = extract_offer_from_card(card)
-                if not info or not info["uid"]: continue
-                if info["uid"] in seen: continue
-                
-                # --- CRITERIA CHECKS ---
-                
-                # 1. Price
-                if info["price"]:
-                    if info["price"] > account["max_price"]: continue
-                    if info["price"] < account.get("min_price", 0): continue
-                
-                # 2. Area
-                if info["area"] and account["min_area"] > 0 and info["area"] < account["min_area"]: continue
-                
-                # 3. Typology
-                if not re.search(account["wanted_typ"], info["typ"] or "", re.IGNORECASE): continue
-                
-                # 4. LOCATION FILTER (For Limitrophes)
-                if section_name == "Communes limitrophes" and account.get("limitrophes_filter"):
-                    loc_upper = (info["loc"] or "").upper()
-                    # Check if at least one allowed city is in the location string
-                    if not any(city in loc_upper for city in account["limitrophes_filter"]):
-                        continue # Skip if it's not Paris or Boulogne
-                
-                # MATCH!
-                target_offer = (card, info)
-                found_match = True
-                break
-            
-            if found_match: break
-        
-        if found_match and target_offer:
-            card_elem, info = target_offer
-            logging.info(f"Applying to: {info}")
-            
-            try:
-                driver.execute_script("arguments[0].scrollIntoView({block:'center'});", card_elem)
-                card_elem.click()
-            except:
-                driver.execute_script("arguments[0].click();", card_elem)
-            
-            success, reason = apply_to_offer(driver, wait)
-            
-            seen.add(info["uid"])
-            save_json(account["seen_file"], list(seen))
-            
-            if success:
-                verify_and_cancel_new_application(driver, wait, account)
-            else:
-                logging.error(f"Failed apply: {reason}")
-        
-        else:
-            logging.info("No new matching offers found.")
-        
-        perform_logout(driver, wait)
-
-    except Exception as e:
-        logging.error(f"Global error for {account['name']}: {e}")
-    finally:
-        try: driver.quit()
-        except: pass
-
-def main():
-    for account in ACCOUNTS:
-        process_account(account)
-
-if __name__ == "__main__":
-    main()
