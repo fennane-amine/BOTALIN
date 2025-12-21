@@ -1,4 +1,4 @@
-name: AL-IN Bot 5min ON / 5min OFF (06:00-20:00 Paris) - cached
+name: AL-IN Bot 15min (06:00-20:00 Paris)
 
 permissions:
   contents: write
@@ -6,8 +6,9 @@ permissions:
 on:
   workflow_dispatch:
   schedule:
-    # every 5 minutes between 04:00-17:59 UTC -> corresponds to 06:00-19:59 Paris (DST aware)
-    - cron: '*/5 4-17 * * *'
+    # On passe à toutes les 15 minutes pour éviter que les jobs se marchent dessus
+    # (0, 15, 30, 45 de chaque heure entre 4h et 17h UTC)
+    - cron: '*/15 4-17 * * *'
 
 concurrency:
   group: al-in-bot-run
@@ -16,6 +17,7 @@ concurrency:
 jobs:
   run-bot:
     runs-on: ubuntu-latest
+    # On laisse 20 minutes max au total
     timeout-minutes: 20
     steps:
       - name: Checkout repo
@@ -47,7 +49,7 @@ jobs:
           SENDER_PASS: ${{ secrets.SENDER_PASS }}
           RECIPIENT_EMAIL: "fennane.mohamedamine@gmail.com, abdelhakim.fennane@sncf.fr"
           
-          # Paramètres (15 minutes max en secondes pour le script python lui-même)
+          # Paramètres
           MAX_RUN_SECONDS: 900 
           POLL_INTERVAL: 15
           HEADLESS: true
