@@ -51,7 +51,8 @@ ACCOUNTS = [
         "min_area": 45,
         "wanted_typ": "T2",
         "section_scope": ["Communes demandées", "Communes limitrophes"],
-        "limitrophes_filter": [], # Empty = No filter (accepts all cities)
+        # UPDATED: Empty list = No city filter (Same behavior as Communes demandées)
+        "limitrophes_filter": [], 
         "seen_file": "offers_seen_account1.json",
         "cand_file": "candidatures_status_account1.json",
     },
@@ -64,7 +65,7 @@ ACCOUNTS = [
         "min_area": 0,
         "wanted_typ": "T4|T5",
         "section_scope": ["Communes demandées"],
-        "limitrophes_filter": [],
+        "limitrophes_filter": [], 
         "seen_file": "offers_seen_account2.json",
         "cand_file": "candidatures_status_account2.json",
     }
@@ -106,27 +107,21 @@ def save_json(path, data):
         pass
 
 def parse_price(price_text: str):
-    if not price_text:
-        return None
+    if not price_text: return None
     cleaned = price_text.replace("\u00A0", " ").strip()
     m = re.search(r"^(\d+(?:[ ]\d+)*)", cleaned)
     if m:
-        try:
-            return int(m.group(1).replace(" ", ""))
-        except:
-            pass
+        try: return int(m.group(1).replace(" ", ""))
+        except: pass
     return None
 
 def parse_area_from_typology(typ_text: str):
-    if not typ_text:
-        return None
+    if not typ_text: return None
     cleaned = typ_text.replace("\u00A0", " ").replace(",", ".")
     m = re.search(r"(\d+(?:\.\d+)?)\s*m", cleaned, re.IGNORECASE)
     if m:
-        try:
-            return float(m.group(1))
-        except:
-            pass
+        try: return float(m.group(1))
+        except: pass
     return None
 
 # ---------- UI HELPERS ----------
@@ -142,10 +137,8 @@ def handle_cookie_banner(driver, timeout=3):
                 el = WebDriverWait(driver, timeout).until(EC.element_to_be_clickable((By.XPATH, s)))
             else:
                 el = WebDriverWait(driver, timeout).until(EC.element_to_be_clickable((By.CSS_SELECTOR, s)))
-            try:
-                el.click()
-            except:
-                driver.execute_script("arguments[0].click();", el)
+            try: el.click()
+            except: driver.execute_script("arguments[0].click();", el)
             logging.info("✅ Bannière cookies acceptée.")
             time.sleep(0.5)
             return True
@@ -195,8 +188,7 @@ def init_driver():
         try:
             st = os.stat(driver_path)
             os.chmod(driver_path, st.st_mode | 0o111)
-        except:
-            pass
+        except: pass
         service = Service(driver_path)
         driver = webdriver.Chrome(service=service, options=options)
     
@@ -254,40 +246,12 @@ def perform_login(driver, wait, email, password):
 
 def ensure_logged_in(driver, wait, email, password):
     try:
-        if len(driver.find_elements(By.CSS_SELECTOR, ".offer-sections")) > 0:
-            return True
-        if "candidature" in driver.current_url:
-            return True
-    except:
-        pass
+        if len(driver.find_elements(By.CSS_SELECTOR, ".offer-sections")) > 0: return True
+        if "candidature" in driver.current_url: return True
+    except: pass
     
     logging.info("Not logged in. Logging in...")
     return perform_login(driver, wait, email, password)
-
-def perform_logout(driver, wait):
-    logging.info("Logging out...")
-    try:
-        # 1. SCROLL TO TOP
-        driver.execute_script("window.scrollTo(0, 0);")
-        time.sleep(1.0) 
-        close_overlays(driver)
-        
-        # 2. Click "Mon compte"
-        mon_compte_btn = wait.until(EC.presence_of_element_located((By.CSS_SELECTOR, "a.lessor-nav-trigger")))
-        driver.execute_script("arguments[0].click();", mon_compte_btn)
-        time.sleep(1.0) 
-
-        # 3. Click "Deconnexion"
-        logout_btn = wait.until(EC.element_to_be_clickable((By.XPATH, "//a[contains(.,'Déconnexion')]")))
-        driver.execute_script("arguments[0].click();", logout_btn)
-        
-        # 4. Wait for login form
-        WebDriverWait(driver, 10).until(EC.presence_of_element_located((By.CSS_SELECTOR, "form.global-form")))
-        logging.info("Logout successful.")
-        return True
-    except Exception as e:
-        logging.warning(f"Logout failed (non-critical): {e}")
-        return False
 
 # ---------- MONITORING (STATUS CHECK) ----------
 
@@ -330,7 +294,6 @@ def track_status_changes(driver, wait, account):
 
             if old_status and status and status != old_status:
                 logging.info(f"Status changed for {uid_key}: {old_status} -> {status}")
-                # SEND EMAIL ON STATUS CHANGE
                 body = f"""
                 Compte: {account['name']}
                 Offre: {title_text}
@@ -366,28 +329,24 @@ def extract_offer_from_card(card):
         try:
             img_el = card.find_element(By.CSS_SELECTOR, ".offer-image img")
             info["img_src"] = img_el.get_attribute("src")
-        except:
-            pass
+        except: pass
         
         try:
             price_el = card.find_element(By.CSS_SELECTOR, ".price")
             info["raw_price"] = price_el.text.strip()
             info["price"] = parse_price(info["raw_price"])
-        except:
-            pass
+        except: pass
             
         try:
             typ_el = card.find_element(By.CSS_SELECTOR, ".typology")
             info["typ"] = typ_el.text.strip()
             info["area"] = parse_area_from_typology(info["typ"])
-        except:
-            pass
+        except: pass
             
         try:
             loc_el = card.find_element(By.CSS_SELECTOR, ".location")
             info["loc"] = loc_el.text.strip()
-        except:
-            pass
+        except: pass
         
         if info["img_src"] and "assets/img" not in info["img_src"]:
             info["uid"] = info["img_src"]
@@ -433,16 +392,13 @@ def apply_to_offer(driver, wait):
         return True, "applied_no_ok"
 
 def extract_rank_from_text(text):
-    if not text:
-        return 999
+    if not text: return 999
     # Case 1: "Position 5"
     m = re.search(r"Position\s*[\n\r]*\s*(\d{1,3})", text, re.IGNORECASE)
-    if m:
-        return int(m.group(1))
+    if m: return int(m.group(1))
     # Case 2: "Il y a actuellement 14 candidatures"
     m2 = re.search(r"actuellement\s*(\d{1,4})\s*candidatures", text, re.IGNORECASE)
-    if m2:
-        return int(m2.group(1))
+    if m2: return int(m2.group(1))
     return 999
 
 def verify_and_cancel_new_application(driver, wait, account):
@@ -457,8 +413,7 @@ def verify_and_cancel_new_application(driver, wait, account):
         return
 
     blocks = driver.find_elements(By.CSS_SELECTOR, ".tdb-s-candidature")
-    if not blocks:
-        return
+    if not blocks: return
     target_block = blocks[0]
 
     try:
@@ -518,7 +473,7 @@ def process_account(account):
     logging.info(f"--- Starting {account['name']} ---")
     
     driver = init_driver()
-    driver.delete_all_cookies()
+    driver.delete_all_cookies() # Start clean
     wait = WebDriverWait(driver, WAIT_TIMEOUT)
     seen = set(load_json(account["seen_file"], []))
     
@@ -535,48 +490,38 @@ def process_account(account):
             driver.get("https://al-in.fr/#/recherche-logement")
             try:
                 WebDriverWait(driver, 8).until(EC.presence_of_element_located((By.CSS_SELECTOR, ".offer-list-container")))
-            except:
-                pass
+            except: pass
 
         found_match = False
         target_offer = None
         
         for section_name in account["section_scope"]:
             btn = find_section_button(driver, section_name)
-            if not btn:
-                continue
+            if not btn: continue
             
             try:
                 driver.execute_script("arguments[0].click();", btn)
                 time.sleep(1.0)
-            except:
-                pass
+            except: pass
             
             try:
                 container = driver.find_element(By.CSS_SELECTOR, ".offer-list-container")
                 progressive_scroll_container_to_bottom(driver, container, max_attempts=4)
-            except:
-                pass
+            except: pass
 
             cards = driver.find_elements(By.CSS_SELECTOR, "app-offer-card")
             for card in cards:
                 info = extract_offer_from_card(card)
-                if not info or not info["uid"]:
-                    continue
-                if info["uid"] in seen:
-                    continue
+                if not info or not info["uid"]: continue
+                if info["uid"] in seen: continue
                 
                 # --- CRITERIA ---
                 if info["price"]:
-                    if info["price"] > account["max_price"]:
-                        continue
-                    if info["price"] < account.get("min_price", 0):
-                        continue
+                    if info["price"] > account["max_price"]: continue
+                    if info["price"] < account.get("min_price", 0): continue
                 
-                if info["area"] and account["min_area"] > 0 and info["area"] < account["min_area"]:
-                    continue
-                if not re.search(account["wanted_typ"], info["typ"] or "", re.IGNORECASE):
-                    continue
+                if info["area"] and account["min_area"] > 0 and info["area"] < account["min_area"]: continue
+                if not re.search(account["wanted_typ"], info["typ"] or "", re.IGNORECASE): continue
                 
                 # LOCATION FILTER (For Limitrophes)
                 if section_name == "Communes limitrophes" and account.get("limitrophes_filter"):
@@ -588,8 +533,7 @@ def process_account(account):
                 found_match = True
                 break
             
-            if found_match:
-                break
+            if found_match: break
         
         if found_match and target_offer:
             card_elem, info = target_offer
@@ -614,15 +558,14 @@ def process_account(account):
         else:
             logging.info("No new matching offers found.")
         
-        perform_logout(driver, wait)
+        # Logout via cookies
+        driver.delete_all_cookies()
 
     except Exception as e:
         logging.error(f"Global error for {account['name']}: {e}")
     finally:
-        try:
-            driver.quit()
-        except:
-            pass
+        try: driver.quit()
+        except: pass
 
 def main():
     for account in ACCOUNTS:
