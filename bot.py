@@ -6,6 +6,7 @@ import time
 import json
 import re
 import logging
+import shutil
 from datetime import datetime
 from email.message import EmailMessage
 import smtplib
@@ -30,7 +31,6 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(
 # ---------- GLOBAL CONFIG ----------
 BASE_URL = "https://al-in.fr/#/connexion-demandeur"
 
-# Timers optimized
 WAIT_TIMEOUT = int(os.environ.get("WAIT_TIMEOUT", "25"))
 HEADLESS = os.environ.get("HEADLESS", "true").lower() in ("1", "true", "yes")
 MAX_RUN_SECONDS = int(os.environ.get("MAX_RUN_SECONDS", "300"))
@@ -51,8 +51,7 @@ ACCOUNTS = [
         "min_area": 45,
         "wanted_typ": "T2",
         "section_scope": ["Communes demandées", "Communes limitrophes"],
-        # UPDATED: Empty list = No city filter (Same behavior as Communes demandées)
-        "limitrophes_filter": [], 
+        "limitrophes_filter": [], # Empty = All cities accepted
         "seen_file": "offers_seen_account1.json",
         "cand_file": "candidatures_status_account1.json",
     },
@@ -168,9 +167,9 @@ def progressive_scroll_container_to_bottom(driver, container, max_attempts=5, pa
     except:
         pass
 
-# ---------- DRIVER ----------
+# ---------- DRIVER (FIXED PROFILE HANDLING) ----------
 
-def init_driver():
+def init_driver(account_name):
     options = Options()
     if HEADLESS:
         options.add_argument("--headless=new")
@@ -179,7 +178,11 @@ def init_driver():
     options.add_argument("--window-size=1920,1080")
     options.add_argument("--disable-gpu")
     options.page_load_strategy = 'eager'
-    options.add_argument(f"--user-data-dir=/tmp/chrome_user_data_{os.getpid()}")
+    
+    # CRITICAL FIX: Unique user-data-dir per account
+    # This ensures Account 2 does not inherit broken state/cookies from Account 1
+    user_data_dir = f"/tmp/chrome_data_{account_name}_{os.getpid()}"
+    options.add_argument(f"--user-data-dir={user_data_dir}")
 
     try:
         driver = webdriver.Chrome(options=options)
@@ -193,9 +196,9 @@ def init_driver():
         driver = webdriver.Chrome(service=service, options=options)
     
     driver.set_page_load_timeout(60)
-    return driver
+    return driver, user_data_dir
 
-# ---------- LOGIN / LOGOUT ----------
+# ---------- LOGIN ----------
 
 def perform_login(driver, wait, email, password):
     try:
@@ -245,6 +248,7 @@ def perform_login(driver, wait, email, password):
         return False
 
 def ensure_logged_in(driver, wait, email, password):
+    # Check if already logged in (unlikely with unique profiles, but good practice)
     try:
         if len(driver.find_elements(By.CSS_SELECTOR, ".offer-sections")) > 0: return True
         if "candidature" in driver.current_url: return True
@@ -253,7 +257,7 @@ def ensure_logged_in(driver, wait, email, password):
     logging.info("Not logged in. Logging in...")
     return perform_login(driver, wait, email, password)
 
-# ---------- MONITORING (STATUS CHECK) ----------
+# ---------- MONITORING ----------
 
 def track_status_changes(driver, wait, account):
     logging.info("Checking for status changes...")
@@ -312,7 +316,6 @@ def track_status_changes(driver, wait, account):
             continue
     
     save_json(account["cand_file"], candidatures)
-
 
 # ---------- OFFERS SEARCH ----------
 
@@ -393,10 +396,8 @@ def apply_to_offer(driver, wait):
 
 def extract_rank_from_text(text):
     if not text: return 999
-    # Case 1: "Position 5"
     m = re.search(r"Position\s*[\n\r]*\s*(\d{1,3})", text, re.IGNORECASE)
     if m: return int(m.group(1))
-    # Case 2: "Il y a actuellement 14 candidatures"
     m2 = re.search(r"actuellement\s*(\d{1,4})\s*candidatures", text, re.IGNORECASE)
     if m2: return int(m2.group(1))
     return 999
@@ -445,7 +446,6 @@ def verify_and_cancel_new_application(driver, wait, account):
         elif rank == 999:
             logging.warning("Rank could not be parsed (999). Keeping candidature.")
         else:
-            # RANK <= 10: SUCCESS EMAIL
             logging.info(f"Rank {rank} is good (<= 10).")
             body = f"""
             FÉLICITATIONS ! Candidature confirmée et bien placée.
@@ -472,8 +472,9 @@ def process_account(account):
 
     logging.info(f"--- Starting {account['name']} ---")
     
-    driver = init_driver()
-    driver.delete_all_cookies() # Start clean
+    # Initialize driver with UNIQUE profile folder
+    driver, user_data_dir = init_driver(account["name"])
+    
     wait = WebDriverWait(driver, WAIT_TIMEOUT)
     seen = set(load_json(account["seen_file"], []))
     
@@ -558,13 +559,16 @@ def process_account(account):
         else:
             logging.info("No new matching offers found.")
         
-        # Logout via cookies
-        driver.delete_all_cookies()
+        # No explicit logout needed, driver.quit() + fresh profile handles it
 
     except Exception as e:
         logging.error(f"Global error for {account['name']}: {e}")
     finally:
-        try: driver.quit()
+        try: 
+            driver.quit()
+            # Cleanup profile directory to save space and ensure next run is fresh
+            if os.path.exists(user_data_dir):
+                shutil.rmtree(user_data_dir, ignore_errors=True)
         except: pass
 
 def main():
