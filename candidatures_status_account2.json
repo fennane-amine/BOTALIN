@@ -6,5 +6,9 @@
   "T4 | PARIS (75) | 802 €": {
     "status": "Inconnu",
     "last_check": "2026-01-26T09:04:42.325533"
+  },
+  "T4 | Paris (75) | 542 €": {
+    "status": "Inconnu",
+    "last_check": "2026-02-07T05:10:03.406527"
   }
 }
