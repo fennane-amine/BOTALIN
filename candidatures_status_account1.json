@@ -26,5 +26,9 @@
   "T2 | OSNY (95) | 715 €": {
     "status": "Inconnu",
     "last_check": "2026-02-23T11:55:19.568993"
+  },
+  "T2 | Paris (75) | 604 €": {
+    "status": "Inconnu",
+    "last_check": "2026-02-23T12:44:50.616036"
   }
 }
