@@ -30,5 +30,9 @@
   "T2 | Paris (75) | 604 €": {
     "status": "Inconnu",
     "last_check": "2026-03-02T07:59:42.253089"
+  },
+  "T2 | JOUY LE MOUTIER (95) | 691 €": {
+    "status": "Inconnu",
+    "last_check": "2026-03-03T13:04:16.660483"
   }
 }
